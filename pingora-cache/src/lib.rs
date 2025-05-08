@@ -24,6 +24,7 @@ use log::warn;
 use pingora_error::Result;
 use pingora_http::ResponseHeader;
 use std::time::{Duration, Instant, SystemTime};
+use storage::MissFinishType;
 use strum::IntoStaticStr;
 use trace::CacheTraceCTX;
 
@@ -755,7 +756,7 @@ impl HttpCache {
                     return Ok(());
                 }
                 let miss_handler = inner.miss_handler.take().unwrap();
-                let size = miss_handler.finish().await?;
+                let finish = miss_handler.finish().await?;
                 let lock = inner.lock.take();
                 let key = inner.key.as_ref().unwrap();
                 if let Some(Locked::Write(permit)) = lock {
@@ -769,7 +770,14 @@ impl HttpCache {
                 if let Some(eviction) = inner.eviction {
                     let cache_key = key.to_compact();
                     let meta = inner.meta.as_ref().unwrap();
-                    let evicted = eviction.admit(cache_key, size, meta.0.internal.fresh_until);
+                    let evicted = match finish {
+                        MissFinishType::Created(size) => {
+                            eviction.admit(cache_key, size, meta.0.internal.fresh_until)
+                        }
+                        MissFinishType::Appended(size) => {
+                            eviction.increment_weight(cache_key, size)
+                        }
+                    };
                     // actual eviction can be done async
                     let span = inner.traces.child("eviction");
                     let handle = span.handle();
@@ -872,9 +880,16 @@ impl HttpCache {
                  */
                 let mut old_header = self.inner().meta.as_ref().unwrap().0.header.clone();
                 let mut clone_header = |header_name: &'static str| {
-                    // TODO: multiple headers
-                    if let Some(value) = resp.headers.get(header_name) {
-                        old_header.insert_header(header_name, value).unwrap();
+                    for (i, value) in resp.headers.get_all(header_name).iter().enumerate() {
+                        if i == 0 {
+                            old_header
+                                .insert_header(header_name, value)
+                                .expect("can add valid header");
+                        } else {
+                            old_header
+                                .append_header(header_name, value)
+                                .expect("can add valid header");
+                        }
                     }
                 };
                 clone_header("cache-control");

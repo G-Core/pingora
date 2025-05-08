@@ -65,6 +65,36 @@ async fn test_connection_die() {
 }
 
 #[tokio::test]
+async fn test_upload_connection_die() {
+    init();
+    let client = reqwest::Client::new();
+    let res = client
+        .post("http://127.0.0.1:6147/upload_connection_die/")
+        .body("b".repeat(15 * 1024 * 1024)) // 15 MB upload
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap();
+    // should get 200 status before connection dies
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.text().await;
+
+    // try h2
+    let client = reqwest::Client::new();
+    let res = client
+        .post("http://127.0.0.1:6147/upload_connection_die/")
+        .body("b".repeat(15 * 1024 * 1024)) // 15 MB upload
+        .timeout(Duration::from_secs(5))
+        .header("x-h2", "true")
+        .send()
+        .await
+        .unwrap();
+    // should get 200 status before connection dies
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = res.text().await;
+}
+
+#[tokio::test]
 async fn test_upload() {
     init();
     let client = reqwest::Client::new();
@@ -388,6 +418,59 @@ mod test_cache {
     }
 
     #[tokio::test]
+    async fn test_cache_upstream_revalidation_appends_headers() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_cache_upstream_revalidation_appends_headers/cache_control";
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("set-cache-control", "public, max-age=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["x-upstream-status"], "200");
+        assert_eq!(headers["cache-control"], "public, max-age=1");
+        assert_eq!(headers.get_all("cache-control").into_iter().count(), 1);
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("set-cache-control", "public, max-age=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert!(headers.get("x-upstream-status").is_none());
+        assert_eq!(headers.get_all("cache-control").into_iter().count(), 1);
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        sleep(Duration::from_millis(1100)).await; // ttl is 1
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("set-cache-control", "public, max-age=1")
+            .header("set-cache-control", "stale-while-revalidate=86400")
+            .header("set-revalidated", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "revalidated");
+        assert_eq!(headers["x-upstream-status"], "304");
+        let mut cc = headers.get_all("cache-control").into_iter();
+        assert_eq!(cc.next().unwrap(), "public, max-age=1");
+        assert_eq!(cc.next().unwrap(), "stale-while-revalidate=86400");
+        assert!(cc.next().is_none());
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
     async fn test_force_miss() {
         init();
         let url = "http://127.0.0.1:6148/unique/test_froce_miss/revalidate_now";
@@ -421,6 +504,48 @@ mod test_cache {
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "miss");
         assert_eq!(headers["x-upstream-status"], "200");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_force_miss_stale() {
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_froce_miss_stale/revalidate_now";
+
+        let res = reqwest::get(url).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let cache_miss_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["x-upstream-status"], "200");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = reqwest::get(url).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        let cache_hit_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert!(headers.get("x-upstream-status").is_none());
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        assert_eq!(cache_miss_epoch, cache_hit_epoch);
+
+        sleep(Duration::from_millis(1100)).await; // ttl is 1
+
+        // stale, but can be forced miss
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-force-miss", "1")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let headers = res.headers();
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(headers["x-upstream-status"], "200");
+        let cache_miss_epoch2 = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert!(cache_miss_epoch != cache_miss_epoch2);
         assert_eq!(res.text().await.unwrap(), "hello world");
     }
 
