@@ -49,7 +49,9 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time;
 
 use pingora_cache::NoCacheReason;
-use pingora_core::apps::{HttpServerApp, HttpServerOptions};
+use pingora_core::apps::{
+    HttpPersistentSettings, HttpServerApp, HttpServerOptions, ReusedHttpStream,
+};
 use pingora_core::connectors::{http::Connector, ConnectorOptions};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
@@ -276,7 +278,7 @@ impl<SV: Sync> HttpProxy<SV> {
         ctx: &mut SV::CTX,
         reuse: bool,
         error: Option<&Error>,
-    ) -> Option<Stream>
+    ) -> Option<ReusedHttpStream>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
@@ -285,7 +287,14 @@ impl<SV: Sync> HttpProxy<SV> {
 
         if reuse {
             // TODO: log error
-            session.downstream_session.finish().await.ok().flatten()
+            let persistent_settings = HttpPersistentSettings::for_session(&session);
+            session
+                .downstream_session
+                .finish()
+                .await
+                .ok()
+                .flatten()
+                .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)))
         } else {
             None
         }
@@ -498,7 +507,7 @@ impl<SV> HttpProxy<SV> {
         self: &Arc<Self>,
         mut session: Session,
         mut ctx: <SV as ProxyHttp>::CTX,
-    ) -> Option<Stream>
+    ) -> Option<ReusedHttpStream>
     where
         SV: ProxyHttp + Send + Sync + 'static,
         <SV as ProxyHttp>::CTX: Send + Sync,
@@ -537,7 +546,14 @@ impl<SV> HttpProxy<SV> {
                     // TODO: log error
                     self.inner.logging(&mut session, None, &mut ctx).await;
                     self.cleanup_sub_req(&mut session);
-                    return session.downstream_session.finish().await.ok().flatten();
+                    let persistent_settings = HttpPersistentSettings::for_session(&session);
+                    return session
+                        .downstream_session
+                        .finish()
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)));
                 }
                 /* else continue */
             }
@@ -694,7 +710,7 @@ impl<SV> HttpProxy<SV> {
         ctx: &mut <SV as ProxyHttp>::CTX,
         e: Box<Error>,
         context: &str,
-    ) -> Option<Stream>
+    ) -> Option<ReusedHttpStream>
     where
         SV: ProxyHttp + Send + Sync + 'static,
         <SV as ProxyHttp>::CTX: Send + Sync,
@@ -712,7 +728,14 @@ impl<SV> HttpProxy<SV> {
         self.cleanup_sub_req(&mut session);
 
         if res.can_reuse_downstream {
-            session.downstream_session.finish().await.ok().flatten()
+            let persistent_settings = HttpPersistentSettings::for_session(&session);
+            session
+                .downstream_session
+                .finish()
+                .await
+                .ok()
+                .flatten()
+                .map(|s| ReusedHttpStream::new(s, Some(persistent_settings)))
         } else {
             None
         }
@@ -775,23 +798,15 @@ where
     async fn process_new_http(
         self: &Arc<Self>,
         session: HttpSession,
-        shutdown: &ShutdownWatch,
-    ) -> Option<Stream> {
+        _shutdown: &ShutdownWatch,
+    ) -> Option<ReusedHttpStream> {
         let session = Box::new(session);
 
         // TODO: keepalive pool, use stack
-        let mut session = match self.handle_new_request(session).await {
+        let session = match self.handle_new_request(session).await {
             Some(downstream_session) => Session::new(downstream_session, &self.downstream_modules),
             None => return None, // bad request
         };
-
-        if *shutdown.borrow() {
-            // stop downstream from reusing if this service is shutting down soon
-            session.set_keepalive(None);
-        } else {
-            // default 60s
-            session.set_keepalive(Some(60));
-        }
 
         let ctx = self.inner.new_ctx();
         self.process_request(session, ctx).await
