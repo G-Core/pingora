@@ -1,6 +1,7 @@
 # Pingora
 
 ![Pingora banner image](./docs/assets/pingora_banner.png)
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FG-Core%2Fpingora.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FG-Core%2Fpingora?ref=badge_shield)
 
 ## What is Pingora
 Pingora is a Rust framework to [build fast, reliable and programmable networked systems](https://blog.cloudflare.com/pingora-open-source).
@@ -78,3 +79,6 @@ Please see our [contribution guidelines](./.github/CONTRIBUTING.md).
 
 # License
 This project is Licensed under [Apache License, Version 2.0](./LICENSE).
+
+
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FG-Core%2Fpingora.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2FG-Core%2Fpingora?ref=badge_large)
