@@ -414,7 +414,10 @@ impl<SV> HttpProxy<SV> {
         SV::CTX: Send + Sync,
     {
         if !from_cache {
-            self.upstream_filter(session, &mut task, ctx).await?;
+            if let Some(duration) = self.upstream_filter(session, &mut task, ctx).await? {
+                trace!("delaying upstream response for {duration:?}");
+                time::sleep(duration).await;
+            }
 
             // cache the original response before any downstream transformation
             // requests that bypassed cache still need to run filters to see if the response has become cacheable
@@ -502,7 +505,7 @@ impl<SV> HttpProxy<SV> {
                     .response_body_filter(session, &mut data, eos, ctx)
                     .await?
                 {
-                    trace!("delaying response for {duration:?}");
+                    trace!("delaying downstream response for {duration:?}");
                     time::sleep(duration).await;
                 }
                 Ok(HttpTask::Body(data, eos))
