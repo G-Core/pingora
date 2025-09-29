@@ -431,7 +431,8 @@ impl Http2Session {
  2. peer sends invalid h2 frames, usually sending h1 only header: we will downgrade and retry
  3. peer sends GO_AWAY(NO_ERROR) connection is being shut down: we will retry
  4. peer IO error on reused conn, usually firewall kills old conn: we will retry
- 5. All other errors will terminate the request
+ 5. peer sends REFUSED_STREAM on RST_STREAM, this is safe to retry
+ 6. All other errors will terminate the request
 */
 fn handle_read_header_error(e: h2::Error) -> Box<Error> {
     if e.is_remote() && (e.reason() == Some(h2::Reason::HTTP_1_1_REQUIRED)) {
@@ -445,6 +446,14 @@ fn handle_read_header_error(e: h2::Error) -> Box<Error> {
         err
     } else if e.is_go_away() && e.is_remote() && (e.reason() == Some(h2::Reason::NO_ERROR)) {
         // is_go_away: retry via another connection, this connection is being teardown
+        let mut err = Error::because(H2Error, "while reading h2 header", e);
+        err.retry = true.into();
+        err
+    } else if e.is_reset() && e.is_remote() && (e.reason() == Some(h2::Reason::REFUSED_STREAM)) {
+        // The REFUSED_STREAM error code can be included in a RST_STREAM frame to indicate
+        // that the stream is being closed prior to any processing having occurred.
+        // Any request that was sent on the reset stream can be safely retried.
+        // https://datatracker.ietf.org/doc/html/rfc9113#section-8.7
         let mut err = Error::because(H2Error, "while reading h2 header", e);
         err.retry = true.into();
         err
