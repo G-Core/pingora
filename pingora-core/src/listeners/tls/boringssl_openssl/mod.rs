@@ -18,7 +18,7 @@ use std::ops::{Deref, DerefMut};
 
 pub use crate::protocols::tls::ALPN;
 use crate::protocols::IO;
-use crate::tls::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
+use crate::tls::ssl::{AlpnError, SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod, SslRef};
 use crate::{
     listeners::TlsAcceptCallbacks,
     protocols::tls::{
@@ -105,6 +105,20 @@ impl TlsSettings {
         self.set_alpn(ALPN::H2H1);
     }
 
+    pub fn enable_h2_with_http2_check(
+        &mut self,
+        check_h2_h1: impl for<'a> Fn(&mut SslRef, &'a [u8]) -> Result<&'a [u8], AlpnError>
+            + 'static
+            + Sync
+            + Send,
+        check_h2: impl for<'a> Fn(&mut SslRef, &'a [u8]) -> Result<&'a [u8], AlpnError>
+            + 'static
+            + Sync
+            + Send,
+    ) {
+        self.set_alpn_with_http2_check(ALPN::H2H1, check_h2_h1, check_h2);
+    }
+
     /// Set the ALPN preference of this endpoint. See [`ALPN`] for more details
     pub fn set_alpn(&mut self, alpn: ALPN) {
         match alpn {
@@ -113,6 +127,25 @@ impl TlsSettings {
                 .set_alpn_select_callback(alpn::prefer_h2),
             ALPN::H1 => self.accept_builder.set_alpn_select_callback(alpn::h1_only),
             ALPN::H2 => self.accept_builder.set_alpn_select_callback(alpn::h2_only),
+        }
+    }
+
+    pub fn set_alpn_with_http2_check(
+        &mut self,
+        alpn: ALPN,
+        check_h2_h1: impl for<'a> Fn(&mut SslRef, &'a [u8]) -> Result<&'a [u8], AlpnError>
+            + 'static
+            + Sync
+            + Send,
+        check_h2: impl for<'a> Fn(&mut SslRef, &'a [u8]) -> Result<&'a [u8], AlpnError>
+            + 'static
+            + Sync
+            + Send,
+    ) {
+        match alpn {
+            ALPN::H2H1 => self.accept_builder.set_alpn_select_callback(check_h2_h1),
+            ALPN::H1 => self.accept_builder.set_alpn_select_callback(alpn::h1_only),
+            ALPN::H2 => self.accept_builder.set_alpn_select_callback(check_h2),
         }
     }
 
@@ -136,7 +169,7 @@ impl Acceptor {
     }
 }
 
-mod alpn {
+pub mod alpn {
     use super::*;
     use crate::tls::ssl::{select_next_proto, AlpnError, SslRef};
 
