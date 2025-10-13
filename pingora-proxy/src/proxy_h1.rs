@@ -56,13 +56,10 @@ impl<SV> HttpProxy<SV> {
         }
 
         if session.cache.enabled() {
-            if let Err(e) = pingora_cache::filters::upstream::request_filter(
+            pingora_cache::filters::upstream::request_filter(
                 &mut req,
                 session.cache.maybe_cache_meta(),
-            ) {
-                session.cache.disable(NoCacheReason::InternalError);
-                warn!("cache upstream filter error {}, disabling cache", e);
-            }
+            );
             session.mark_upstream_headers_mutated_for_cache();
         }
 
@@ -165,10 +162,13 @@ impl<SV> HttpProxy<SV> {
                     match res {
                         Ok(task) => {
                             response_done = task.is_end();
+                            let type_str = task.type_str();
                             let result = tx.send(task)
-                                .await.or_err(
-                                        InternalError,
-                                        "Failed to send upstream header to pipe");
+                                .await.or_err_with(
+                                    InternalError,
+                                    || format!("Failed to send upstream task {type_str}{} to pipe",
+                                        if response_done { " (end)" } else {""})
+                                );
                             // If the request is upgraded, the downstream pipe can early exit
                             // when the downstream connection is closed.
                             // In that case, this function should ignore that the pipe is closed.
