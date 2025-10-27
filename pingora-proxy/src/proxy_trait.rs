@@ -15,7 +15,7 @@
 use super::*;
 use pingora_cache::{
     key::HashBinary,
-    CacheKey, CacheMeta, ForcedInvalidationKind, HitHandler,
+    CacheKey, CacheMeta, ForcedFreshness, HitHandler,
     RespCacheable::{self, *},
 };
 use proxy_cache::range_filter::{self};
@@ -144,7 +144,7 @@ pub trait ProxyHttp {
         Ok(CacheKey::default(req_header))
     }
 
-    /// This callback is invoked when a cacheable response is ready to be admitted to cache
+    /// This callback is invoked when a cacheable response is ready to be admitted to cache.
     fn cache_miss(&self, session: &mut Session, _ctx: &mut Self::CTX) {
         session.cache.cache_miss();
     }
@@ -165,7 +165,7 @@ pub trait ProxyHttp {
         _hit_handler: &mut HitHandler,
         _is_fresh: bool,
         _ctx: &mut Self::CTX,
-    ) -> Result<Option<ForcedInvalidationKind>>
+    ) -> Result<Option<ForcedFreshness>>
     where
         Self::CTX: Send + Sync,
     {

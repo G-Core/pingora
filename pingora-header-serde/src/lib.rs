@@ -26,7 +26,7 @@ mod thread_zstd;
 
 use bytes::BufMut;
 use http::Version;
-use pingora_error::{Error, ErrorType, Result};
+use pingora_error::{Error, ErrorType, ImmutStr, Result};
 use pingora_http::ResponseHeader;
 use std::cell::RefCell;
 use std::ops::DerefMut;
@@ -104,7 +104,7 @@ enum ZstdCompression {
 }
 
 #[inline]
-fn into_error(e: &'static str, context: &'static str) -> Box<Error> {
+fn into_error<S: Into<ImmutStr>>(e: &'static str, context: S) -> Box<Error> {
     Error::because(ErrorType::InternalError, context, e)
 }
 
@@ -122,13 +122,42 @@ impl ZstdCompression {
 
     fn decompress_to_buffer(&self, source: &[u8], destination: &mut Vec<u8>) -> Result<usize> {
         match &self {
-            ZstdCompression::Default(c, _) => c
-                .decompress_to_buffer(source, destination)
-                .map_err(|e| into_error(e, "decompress header")),
-            ZstdCompression::WithDict(c) => c
-                .decompress_to_buffer(source, destination)
-                .map_err(|e| into_error(e, "decompress header")),
+            ZstdCompression::Default(c, _) => {
+                c.decompress_to_buffer(source, destination).map_err(|e| {
+                    into_error(
+                        e,
+                        format!(
+                            "decompress header, frame_content_size: {}",
+                            get_frame_content_size(source)
+                        ),
+                    )
+                })
+            }
+            ZstdCompression::WithDict(c) => {
+                c.decompress_to_buffer(source, destination).map_err(|e| {
+                    into_error(
+                        e,
+                        format!(
+                            "decompress header, frame_content_size: {}",
+                            get_frame_content_size(source)
+                        ),
+                    )
+                })
+            }
         }
+    }
+}
+
+#[inline]
+fn get_frame_content_size(source: &[u8]) -> ImmutStr {
+    match zstd_safe::get_frame_content_size(source) {
+        Ok(Some(size)) => match size {
+            zstd_safe::CONTENTSIZE_ERROR => ImmutStr::from("invalid"),
+            zstd_safe::CONTENTSIZE_UNKNOWN => ImmutStr::from("unknown"),
+            _ => ImmutStr::from(size.to_string()),
+        },
+        Ok(None) => ImmutStr::from("none"),
+        Err(_e) => ImmutStr::from("failed"),
     }
 }
 

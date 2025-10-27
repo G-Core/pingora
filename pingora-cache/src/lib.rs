@@ -220,16 +220,20 @@ impl RespCacheable {
     }
 }
 
-/// Indicators of which level of purge logic to apply to an asset. As in should
-/// the purged file be revalidated or re-retrieved altogether
+/// Indicators of which level of cache freshness logic to force apply to an asset.
+///
+/// For example, should an existing fresh asset be revalidated or re-retrieved altogether.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForcedInvalidationKind {
+pub enum ForcedFreshness {
     /// Indicates the asset should be considered stale and revalidated
     ForceExpired,
 
     /// Indicates the asset should be considered absent and treated like a miss
     /// instead of a hit
     ForceMiss,
+
+    /// Indicates the asset should be considered fresh despite possibly being stale
+    ForceFresh,
 }
 
 /// Freshness state of cache hit asset
@@ -253,6 +257,9 @@ pub enum HitStatus {
 
     /// The asset is not expired
     Fresh,
+
+    /// Asset exists but is expired, forced to be a hit
+    ForceFresh,
 }
 
 impl HitStatus {
@@ -263,7 +270,7 @@ impl HitStatus {
 
     /// Whether cached asset can be served as fresh
     pub fn is_fresh(&self) -> bool {
-        *self == HitStatus::Fresh
+        *self == HitStatus::Fresh || *self == HitStatus::ForceFresh
     }
 
     /// Check whether the hit status should be treated as a miss. A forced miss
@@ -714,7 +721,7 @@ impl HttpCache {
         }
 
         self.phase = match hit_status {
-            HitStatus::Fresh => CachePhase::Hit,
+            HitStatus::Fresh | HitStatus::ForceFresh => CachePhase::Hit,
             HitStatus::Expired | HitStatus::ForceExpired => CachePhase::Stale,
             HitStatus::FailedHitFilter | HitStatus::ForceMiss => self.phase,
         };
@@ -730,9 +737,10 @@ impl HttpCache {
 
         // The cache lock might not be set for stale hit or hits treated as
         // misses, so we need to initialize it here
-        if phase == CachePhase::Stale || hit_status.is_treated_as_miss() {
+        let stale = phase == CachePhase::Stale;
+        if stale || hit_status.is_treated_as_miss() {
             if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
-                lock_ctx.lock = Some(lock_ctx.cache_lock.lock(key));
+                lock_ctx.lock = Some(lock_ctx.cache_lock.lock(key, stale));
             }
         }
 
@@ -1030,6 +1038,18 @@ impl HttpCache {
 
                 inner_enabled.meta.replace(meta);
 
+                let mut span = inner_enabled.traces.child("update_meta");
+                let result = inner_enabled
+                    .storage
+                    .update_meta(
+                        inner.key.as_ref().unwrap(),
+                        inner_enabled.meta.as_ref().unwrap(),
+                        &span.handle(),
+                    )
+                    .await;
+                span.set_tag(|| trace::Tag::new("updated", result.is_ok()));
+
+                // regardless of result, release the cache lock
                 if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
                     let lock = lock_ctx.lock.take();
                     if let Some(Locked::Write(permit)) = lock {
@@ -1041,17 +1061,6 @@ impl HttpCache {
                     }
                 }
 
-                let mut span = inner_enabled.traces.child("update_meta");
-                // TODO: this call can be async
-                let result = inner_enabled
-                    .storage
-                    .update_meta(
-                        inner.key.as_ref().unwrap(),
-                        inner_enabled.meta.as_ref().unwrap(),
-                        &span.handle(),
-                    )
-                    .await;
-                span.set_tag(|| trace::Tag::new("updated", result.is_ok()));
                 result
             }
             _ => panic!("wrong phase {:?}", self.phase),
@@ -1276,7 +1285,7 @@ impl HttpCache {
                 });
                 if result.is_none() {
                     if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
-                        lock_ctx.lock = Some(lock_ctx.cache_lock.lock(key));
+                        lock_ctx.lock = Some(lock_ctx.cache_lock.lock(key, false));
                     }
                 }
                 span.set_tag(|| trace::Tag::new("found", result.is_some()));
