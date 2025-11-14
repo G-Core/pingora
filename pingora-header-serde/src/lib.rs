@@ -42,7 +42,8 @@ pub struct HeaderSerde {
     buf: ThreadLocal<RefCell<Vec<u8>>>,
 }
 
-const MAX_HEADER_SIZE: usize = 64 * 1024;
+const MAX_HEADER_BUF_SIZE: usize = 128 * 1024; // 128KB
+
 const COMPRESS_LEVEL: i32 = 3;
 
 impl HeaderSerde {
@@ -76,7 +77,7 @@ impl HeaderSerde {
         // TODO: should convert to h1 if the incoming header is for h2
         let mut buf = self
             .buf
-            .get_or(|| RefCell::new(Vec::with_capacity(MAX_HEADER_SIZE)))
+            .get_or(|| RefCell::new(Vec::with_capacity(MAX_HEADER_BUF_SIZE)))
             .borrow_mut();
         buf.clear(); // reset the buf
         resp_header_to_buf(header, &mut buf);
@@ -87,7 +88,7 @@ impl HeaderSerde {
     pub fn deserialize(&self, data: &[u8]) -> Result<ResponseHeader> {
         let mut buf = self
             .buf
-            .get_or(|| RefCell::new(Vec::with_capacity(MAX_HEADER_SIZE)))
+            .get_or(|| RefCell::new(Vec::with_capacity(MAX_HEADER_BUF_SIZE)))
             .borrow_mut();
         buf.clear(); // reset the buf
         self.compression

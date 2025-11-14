@@ -823,6 +823,18 @@ impl HttpCache {
         }
     }
 
+    /// Return whether the underlying storage backend supports streaming partial write.
+    ///
+    /// Returns None if cache is not enabled.
+    pub fn support_streaming_partial_write(&self) -> Option<bool> {
+        self.inner.as_ref().and_then(|inner| {
+            inner
+                .enabled_ctx
+                .as_ref()
+                .map(|c| c.storage.support_streaming_partial_write())
+        })
+    }
+
     /// Call this when cache hit is fully read.
     ///
     /// This call will release resource if any and log the timing in tracing if set.
@@ -1250,6 +1262,18 @@ impl HttpCache {
         }
     }
 
+    /// Return the [`CacheKey`] of this asset if any.
+    ///
+    /// This is allowed to be called in any phase. If the cache key callback was not called,
+    /// this will return None.
+    pub fn maybe_cache_key(&self) -> Option<&CacheKey> {
+        (!matches!(
+            self.phase(),
+            CachePhase::Disabled(NoCacheReason::NeverEnabled) | CachePhase::Uninit
+        ))
+        .then(|| self.cache_key())
+    }
+
     /// Perform the cache lookup from the given cache storage with the given cache key
     ///
     /// A cache hit will return [CacheMeta] which contains the header and meta info about
@@ -1426,7 +1450,7 @@ impl HttpCache {
         let mut span = inner_enabled.traces.child("cache_lock");
         // should always call is_cache_locked() before this function, which should guarantee that
         // the inner cache has a read lock and lock ctx
-        if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
+        let (read_lock, status) = if let Some(lock_ctx) = inner_enabled.lock_ctx.as_mut() {
             let lock = lock_ctx.lock.take(); // remove the lock from self
             if let Some(Locked::Read(r)) = lock {
                 let now = Instant::now();
@@ -1445,15 +1469,19 @@ impl HttpCache {
                     r.lock_status()
                 };
                 self.digest.add_lock_duration(now.elapsed());
-                let tag_value: &'static str = status.into();
-                span.set_tag(|| Tag::new("status", tag_value));
-                status
+                (r, status)
             } else {
                 panic!("cache_lock_wait on wrong type of lock")
             }
         } else {
             panic!("cache_lock_wait without cache lock")
+        };
+        if let Some(lock_ctx) = self.inner_enabled().lock_ctx.as_ref() {
+            lock_ctx
+                .cache_lock
+                .trace_lock_wait(&mut span, &read_lock, status);
         }
+        status
     }
 
     /// How long did this request wait behind the read lock
