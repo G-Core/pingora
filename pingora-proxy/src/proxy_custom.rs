@@ -590,7 +590,8 @@ where
                 let mut data = range_body_filter.filter_body(data);
                 if let Some(duration) = self
                     .inner
-                    .response_body_filter(session, &mut data, eos, ctx).await?
+                    .response_body_filter(session, &mut data, eos, ctx)
+                    .await?
                 {
                     trace!("delaying response for {duration:?}");
                     time::sleep(duration).await;
