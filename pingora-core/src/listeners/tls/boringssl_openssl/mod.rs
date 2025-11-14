@@ -159,6 +159,18 @@ impl TlsSettings {
             ALPN::H2H1 => self.accept_builder.set_alpn_select_callback(check_h2_h1),
             ALPN::H1 => self.accept_builder.set_alpn_select_callback(alpn::h1_only),
             ALPN::H2 => self.accept_builder.set_alpn_select_callback(check_h2),
+            ALPN::Custom(custom) => {
+                self.accept_builder
+                    .set_alpn_select_callback(move |_, alpn_in| {
+                        if !valid_alpn(alpn_in) {
+                            return Err(AlpnError::NOACK);
+                        }
+                        match alpn::select_protocol(alpn_in, custom.protocol()) {
+                            Some(p) => Ok(p),
+                            None => Err(AlpnError::NOACK),
+                        }
+                    });
+            }
         }
     }
 
