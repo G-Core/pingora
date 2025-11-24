@@ -167,6 +167,10 @@ where
         let (server_session_reuse, client_session_reuse, error) =
             self.proxy_1to1(session, client_session, peer, ctx).await;
 
+        // Record upstream response body bytes received (payload only) for logging consumers.
+        let upstream_bytes_total = client_session.body_bytes_received();
+        session.set_upstream_body_bytes_received(upstream_bytes_total);
+
         (server_session_reuse, client_session_reuse, error)
     }
 
@@ -628,6 +632,10 @@ where
                         range_body_filter.set(range_type);
                     }
                 }
+
+                // TODO: just set version to Version::HTTP_11 unconditionally here,
+                // (with another todo being an option to faithfully proxy the <1.1 responses)
+                // as we are already trying to mutate this for HTTP/1.1 downstream reuse
 
                 /* Convert HTTP 1.0 style response to chunked encoding so that we don't
                  * have to close the downstream connection */

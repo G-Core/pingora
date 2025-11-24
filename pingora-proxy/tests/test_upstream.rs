@@ -19,7 +19,7 @@ use utils::websocket::WS_ECHO;
 
 use futures::{SinkExt, StreamExt};
 use reqwest::header::{HeaderName, HeaderValue};
-use reqwest::StatusCode;
+use reqwest::{StatusCode, Version};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
@@ -361,6 +361,61 @@ mod test_cache {
         let headers = res.headers();
         assert_eq!(headers["x-cache-status"], "miss");
         assert_eq!(res.text().await.unwrap(), "no if headers detected\n");
+    }
+
+    #[tokio::test]
+    async fn test_cache_http10() {
+        // allow caching http1.0 from origin, but proxy as h1.1 downstream
+        init();
+        let url = "http://127.0.0.1:6148/unique/test_cache_http10/now";
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-upstream-fake-http10", "1") // fake http1.0 in upstream response filter
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.version(), Version::HTTP_11);
+        let headers = res.headers();
+        let cache_miss_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["transfer-encoding"], "chunked");
+        assert_eq!(headers["x-cache-status"], "miss");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-upstream-fake-http10", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.version(), Version::HTTP_11);
+        let headers = res.headers();
+        let cache_hit_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["transfer-encoding"], "chunked");
+        assert_eq!(headers["x-cache-status"], "hit");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        assert_eq!(cache_miss_epoch, cache_hit_epoch);
+
+        sleep(Duration::from_millis(1100)).await; // ttl is 1
+
+        let res = reqwest::Client::new()
+            .get(url)
+            .header("x-upstream-fake-http10", "1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.version(), Version::HTTP_11);
+        let headers = res.headers();
+        let cache_expired_epoch = headers["x-epoch"].to_str().unwrap().parse::<f64>().unwrap();
+        assert_eq!(headers["transfer-encoding"], "chunked");
+        assert_eq!(headers["x-cache-status"], "expired");
+        assert_eq!(res.text().await.unwrap(), "hello world");
+
+        assert!(cache_expired_epoch > cache_hit_epoch);
     }
 
     #[tokio::test]
@@ -1581,8 +1636,8 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            // cache lock timeout, disable cache
-            assert_eq!(headers["x-cache-status"], "no-cache");
+            // cache lock timeout, try to replace lock
+            assert_eq!(headers["x-cache-status"], "miss");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
 
@@ -1599,26 +1654,16 @@ mod test_cache {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let headers = res.headers();
-            // this is now a miss because we will not timeout on cache lock
+            // this is now a hit because the second task cached from origin
+            // successfully
             // and will fetch from origin successfully
-            assert_eq!(headers["x-cache-status"], "miss");
+            assert_eq!(headers["x-cache-status"], "hit");
             assert_eq!(res.text().await.unwrap(), "hello world");
         });
 
         task1.await.unwrap();
         task2.await.unwrap();
         task3.await.unwrap();
-
-        let res = reqwest::Client::new()
-            .get(url)
-            .header("x-lock", "true")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), 200);
-        let headers = res.headers();
-        assert_eq!(headers["x-cache-status"], "hit"); // the first request cached it
-        assert_eq!(res.text().await.unwrap(), "hello world");
     }
 
     #[tokio::test]

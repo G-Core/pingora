@@ -688,7 +688,7 @@ impl HttpCache {
         self.inner_mut()
             .max_file_size_tracker
             .as_mut()
-            .map_or(true, |t| t.add_body_bytes(bytes_len))
+            .is_none_or(|t| t.add_body_bytes(bytes_len))
     }
 
     /// Check if the max file size has been exceeded according to max file size tracker.
@@ -981,8 +981,8 @@ impl HttpCache {
                         MissFinishType::Created(size) => {
                             eviction.admit(cache_key, size, meta.0.internal.fresh_until)
                         }
-                        MissFinishType::Appended(size) => {
-                            eviction.increment_weight(cache_key, size)
+                        MissFinishType::Appended(size, max_size) => {
+                            eviction.increment_weight(&cache_key, size, max_size)
                         }
                     };
                     // actual eviction can be done async
@@ -1461,8 +1461,7 @@ impl HttpCache {
                         wait_timeout.saturating_sub(self.lock_duration().unwrap_or(Duration::ZERO));
                     match timeout(wait_timeout, r.wait()).await {
                         Ok(()) => r.lock_status(),
-                        // TODO: need to differentiate WaitTimeout vs. Lock(Age)Timeout (expired)?
-                        Err(_) => LockStatus::Timeout,
+                        Err(_) => LockStatus::WaitTimeout,
                     }
                 } else {
                     r.wait().await;
