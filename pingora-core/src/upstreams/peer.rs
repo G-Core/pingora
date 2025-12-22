@@ -17,6 +17,8 @@
 use crate::connectors::{l4::BindTo, L4Connect};
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::tls::CaType;
+#[cfg(feature = "openssl_derived")]
+use crate::protocols::tls::HandshakeCompleteHook;
 #[cfg(feature = "s2n")]
 use crate::protocols::tls::PskType;
 #[cfg(unix)]
@@ -45,6 +47,23 @@ use std::time::Duration;
 use tokio::net::TcpSocket;
 
 pub use crate::protocols::tls::ALPN;
+
+/// A hook function that may generate user data for [`crate::protocols::raw_connect::ProxyDigest`].
+///
+/// Takes the request and response headers from the proxy connection establishment, and may produce
+/// arbitrary data to be stored in ProxyDigest's user_data field.
+///
+/// This can be useful when, for example, you want to store some parameter(s) from the request or
+/// response headers from when the proxy connection was first established.
+pub type ProxyDigestUserDataHook = Arc<
+    dyn Fn(
+            &http::request::Parts,         // request headers
+            &pingora_http::ResponseHeader, // response headers
+        ) -> Option<Box<dyn std::any::Any + Send + Sync>>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 /// The interface to trace the connection
 pub trait Tracing: Send + Sync + std::fmt::Debug {
@@ -261,6 +280,29 @@ pub trait Peer: Display + Clone {
             .upstream_tcp_sock_tweak_hook
             .as_ref()
     }
+
+    /// Returns a [`ProxyDigestUserDataHook`] that may generate user data for
+    /// [`crate::protocols::raw_connect::ProxyDigest`] when establishing a new proxy connection.
+    fn proxy_digest_user_data_hook(&self) -> Option<&ProxyDigestUserDataHook> {
+        self.get_peer_options()?
+            .proxy_digest_user_data_hook
+            .as_ref()
+    }
+
+    /// Returns a hook that should be run on TLS handshake completion.
+    ///
+    /// Any value returned from the returned hook (other than `None`) will be stored in the
+    /// `extension` field of `SslDigest`. This allows you to attach custom application-specific
+    /// data to the TLS connection, which will be accessible from the HTTP layer via the
+    /// `SslDigest` attached to the session digest.
+    ///
+    /// Currently only enabled for openssl variants with meaningful `TlsRef`s.
+    #[cfg(feature = "openssl_derived")]
+    fn upstream_tls_handshake_complete_hook(&self) -> Option<&HandshakeCompleteHook> {
+        self.get_peer_options()?
+            .upstream_tls_handshake_complete_hook
+            .as_ref()
+    }
 }
 
 /// A simple TCP or TLS peer without many complicated settings.
@@ -406,6 +448,15 @@ pub struct PeerOptions {
     #[derivative(Debug = "ignore")]
     pub upstream_tcp_sock_tweak_hook:
         Option<Arc<dyn Fn(&TcpSocket) -> Result<()> + Send + Sync + 'static>>,
+    #[derivative(Debug = "ignore")]
+    pub proxy_digest_user_data_hook: Option<ProxyDigestUserDataHook>,
+    /// Hook that allows returning an optional `SslDigestExtension`.
+    /// Any returned value will be saved into the `SslDigest`.
+    ///
+    /// Currently only enabled for openssl variants with meaningful `TlsRef`s.
+    #[cfg(feature = "openssl_derived")]
+    #[derivative(Debug = "ignore")]
+    pub upstream_tls_handshake_complete_hook: Option<HandshakeCompleteHook>,
 }
 
 impl PeerOptions {
@@ -443,6 +494,9 @@ impl PeerOptions {
             tracer: None,
             custom_l4: None,
             upstream_tcp_sock_tweak_hook: None,
+            proxy_digest_user_data_hook: None,
+            #[cfg(feature = "openssl_derived")]
+            upstream_tls_handshake_complete_hook: None,
         }
     }
 
