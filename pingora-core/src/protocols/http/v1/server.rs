@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -119,7 +119,8 @@ impl HttpSession {
             digest,
             min_send_rate: None,
             ignore_info_resp: false,
-            close_on_response_before_downstream_finish: false,
+            // default on to avoid rejecting requests after body as pipelined
+            close_on_response_before_downstream_finish: true,
         }
     }
 
@@ -472,7 +473,10 @@ impl HttpSession {
             }
         }
 
-        if self.close_on_response_before_downstream_finish && !self.is_body_done() {
+        // if body unfinished, or request header was not finished reading
+        if self.close_on_response_before_downstream_finish
+            && (self.request_header.is_none() || !self.is_body_done())
+        {
             debug!("set connection close before downstream finish");
             self.set_keepalive(None);
         }
@@ -1563,6 +1567,15 @@ mod tests_stream {
         assert_eq!(&InvalidHTTPHeader, res.unwrap_err().etype());
     }
 
+    #[tokio::test]
+    async fn read_invalid_header_end() {
+        let input = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 3\r\r\nConnection: keep-alive\r\n\r\nabc";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let res = http_stream.read_request().await;
+        assert_eq!(&InvalidHTTPHeader, res.unwrap_err().etype());
+    }
+
     async fn build_req(upgrade: &str, conn: &str) -> HttpSession {
         let input = format!("GET / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: {upgrade}\r\nConnection: {conn}\r\n\r\n");
         let mock_io = Builder::new().read(input.as_bytes()).build();
@@ -1671,9 +1684,11 @@ mod tests_stream {
 
     #[tokio::test]
     async fn write() {
-        let wire = b"HTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
-        let mock_io = Builder::new().write(wire).build();
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
+        let write_expected = b"HTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
+        let mock_io = Builder::new().read(read_wire).write(write_expected).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
         let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
         new_response.append_header("Foo", "Bar").unwrap();
         http_stream.update_resp_headers = false;
@@ -1685,9 +1700,11 @@ mod tests_stream {
 
     #[tokio::test]
     async fn write_custom_reason() {
-        let wire = b"HTTP/1.1 200 Just Fine\r\nFoo: Bar\r\n\r\n";
-        let mock_io = Builder::new().write(wire).build();
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
+        let write_expected = b"HTTP/1.1 200 Just Fine\r\nFoo: Bar\r\n\r\n";
+        let mock_io = Builder::new().read(read_wire).write(write_expected).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
         let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
         new_response.set_reason_phrase(Some("Just Fine")).unwrap();
         new_response.append_header("Foo", "Bar").unwrap();
@@ -1700,9 +1717,11 @@ mod tests_stream {
 
     #[tokio::test]
     async fn write_informational() {
-        let wire = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
-        let mock_io = Builder::new().write(wire).build();
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
+        let write_expected = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
+        let mock_io = Builder::new().read(read_wire).write(write_expected).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
         let response_100 = ResponseHeader::build(StatusCode::CONTINUE, None).unwrap();
         http_stream
             .write_response_header_ref(&response_100)
@@ -1719,11 +1738,13 @@ mod tests_stream {
 
     #[tokio::test]
     async fn write_informational_ignored() {
-        let wire = b"HTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
-        let mock_io = Builder::new().write(wire).build();
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
+        let write_expected = b"HTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
+        let mock_io = Builder::new().read(read_wire).write(write_expected).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
         // ignore the 100 Continue
         http_stream.ignore_info_resp = true;
+        http_stream.read_request().await.unwrap();
         let response_100 = ResponseHeader::build(StatusCode::CONTINUE, None).unwrap();
         http_stream
             .write_response_header_ref(&response_100)
@@ -1788,10 +1809,16 @@ mod tests_stream {
 
     #[tokio::test]
     async fn write_101_switching_protocol() {
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
         let wire = b"HTTP/1.1 101 Switching Protocols\r\nFoo: Bar\r\n\r\n";
         let wire_body = b"nPAYLOAD";
-        let mock_io = Builder::new().write(wire).write(wire_body).build();
+        let mock_io = Builder::new()
+            .read(read_wire)
+            .write(wire)
+            .write(wire_body)
+            .build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
         let mut response_101 =
             ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
         response_101.append_header("Foo", "Bar").unwrap();
@@ -1813,10 +1840,16 @@ mod tests_stream {
 
     #[tokio::test]
     async fn write_body_cl() {
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
         let wire_header = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n";
         let wire_body = b"a";
-        let mock_io = Builder::new().write(wire_header).write(wire_body).build();
+        let mock_io = Builder::new()
+            .read(read_wire)
+            .write(wire_header)
+            .write(wire_body)
+            .build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
         let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
         new_response.append_header("Content-Length", "1").unwrap();
         http_stream.update_resp_headers = false;
@@ -1836,10 +1869,16 @@ mod tests_stream {
 
     #[tokio::test]
     async fn write_body_http10() {
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
         let wire_header = b"HTTP/1.1 200 OK\r\n\r\n";
         let wire_body = b"a";
-        let mock_io = Builder::new().write(wire_header).write(wire_body).build();
+        let mock_io = Builder::new()
+            .read(read_wire)
+            .write(wire_header)
+            .write(wire_body)
+            .build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
         let new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
         http_stream.update_resp_headers = false;
         http_stream
@@ -1855,15 +1894,18 @@ mod tests_stream {
 
     #[tokio::test]
     async fn write_body_chunk() {
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
         let wire_header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
         let wire_body = b"1\r\na\r\n";
         let wire_end = b"0\r\n\r\n";
         let mock_io = Builder::new()
+            .read(read_wire)
             .write(wire_header)
             .write(wire_body)
             .write(wire_end)
             .build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
         let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
         new_response
             .append_header("Transfer-Encoding", "chunked")
@@ -1934,9 +1976,11 @@ mod tests_stream {
 
     #[tokio::test]
     async fn test_write_body_buf() {
-        let wire = b"HTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
-        let mock_io = Builder::new().write(wire).build();
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
+        let write_expected = b"HTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
+        let mock_io = Builder::new().read(read_wire).write(write_expected).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
         let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
         new_response.append_header("Foo", "Bar").unwrap();
         http_stream.update_resp_headers = false;
@@ -1951,14 +1995,17 @@ mod tests_stream {
     #[tokio::test]
     #[should_panic(expected = "There is still data left to write.")]
     async fn test_write_body_buf_write_timeout() {
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
         let wire1 = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
         let wire2 = b"abc";
         let mock_io = Builder::new()
+            .read(read_wire)
             .write(wire1)
             .wait(Duration::from_millis(500))
             .write(wire2)
             .build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
         http_stream.write_timeout = Some(Duration::from_millis(100));
         let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
         new_response.append_header("Content-Length", "3").unwrap();
@@ -1974,9 +2021,11 @@ mod tests_stream {
 
     #[tokio::test]
     async fn test_write_continue_resp() {
-        let wire = b"HTTP/1.1 100 Continue\r\n\r\n";
-        let mock_io = Builder::new().write(wire).build();
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
+        let write_expected = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let mock_io = Builder::new().read(read_wire).write(write_expected).build();
         let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
         http_stream.write_continue_response().await.unwrap();
     }
 

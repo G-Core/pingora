@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -640,6 +640,17 @@ impl HttpPeer {
             group_key: 0,
             options: PeerOptions::new(),
         }
+    }
+
+    /// Create a new [`HttpPeer`] with client certificate and key for mutual TLS.
+    pub fn new_mtls<A: ToInetSocketAddrs>(
+        address: A,
+        sni: String,
+        client_cert_key: Arc<CertKey>,
+    ) -> Self {
+        let mut peer = Self::new(address, true, sni);
+        peer.client_cert_key = Some(client_cert_key);
+        peer
     }
 
     fn peer_hash(&self) -> u64 {

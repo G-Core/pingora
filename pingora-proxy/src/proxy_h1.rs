@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -115,12 +115,13 @@ where
         );
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
-            match custom_session.restore_custom_message_writer(
-                downstream_custom_message_writer.expect("downstream be present"),
-            ) {
-                Ok(_) => { /* continue */ }
-                Err(e) => {
-                    return (false, false, Some(e));
+            if let Some(downstream_custom_message_writer) = downstream_custom_message_writer {
+                match custom_session.restore_custom_message_writer(downstream_custom_message_writer)
+                {
+                    Ok(_) => { /* continue */ }
+                    Err(e) => {
+                        return (false, false, Some(e));
+                    }
                 }
             }
         }
@@ -542,6 +543,14 @@ where
                 else => {
                     break;
                 }
+            }
+        }
+
+        if let Some(custom_session) = session.downstream_session.as_custom_mut() {
+            if let Some(downstream_custom_message_reader) = downstream_custom_message_reader {
+                custom_session
+                    .restore_custom_message_reader(downstream_custom_message_reader)
+                    .expect("downstream restore_custom_message_reader should be empty");
             }
         }
 

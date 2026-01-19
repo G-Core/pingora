@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -398,8 +398,7 @@ impl HttpCache {
                         OriginNotCache | ResponseTooLarge | PredictedResponseTooLarge => {
                             LockStatus::GiveUp
                         }
-                        // not sure which LockStatus make sense, we treat it as GiveUp for now
-                        Custom(_) => LockStatus::GiveUp,
+                        Custom(reason) => lock_ctx.cache_lock.custom_lock_status(reason),
                         // should never happen, NeverEnabled shouldn't hold a lock
                         NeverEnabled => panic!("NeverEnabled holds a write lock"),
                         CacheLockGiveUp | CacheLockTimeout => {

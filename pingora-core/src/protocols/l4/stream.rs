@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -201,7 +201,7 @@ impl AsyncRead for RawStreamWrapper {
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_read(cx, buf),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_read(cx, buf),
-                RawStream::Virtual(s) => return Pin::new_unchecked(s).poll_read(cx, buf),
+                RawStream::Virtual(s) => Pin::new_unchecked(s).poll_read(cx, buf),
             }
         }
     }

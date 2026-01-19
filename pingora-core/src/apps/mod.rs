@@ -1,4 +1,4 @@
-// Copyright 2025 Cloudflare, Inc.
+// Copyright 2026 Cloudflare, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -61,7 +61,7 @@ pub trait ServerApp {
 #[derive(Default)]
 /// HTTP Server options that control how the server handles some transport types.
 pub struct HttpServerOptions {
-    /// Use HTTP/2 for plaintext.
+    /// Allow HTTP/2 for plaintext.
     pub h2c: bool,
 
     #[doc(hidden)]
