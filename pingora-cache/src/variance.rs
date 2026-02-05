@@ -1,8 +1,8 @@
 use std::{borrow::Cow, collections::BTreeMap};
 
-use blake2::Digest;
+use xxhash_rust::xxh3::Xxh3;
 
-use crate::key::{Blake2b128, HashBinary};
+use crate::key::HashBinary;
 
 /// A builder for variance keys, used for distinguishing multiple cached assets
 /// at the same URL. This is intended to be easily passed to helper functions,
@@ -44,14 +44,15 @@ impl<'a> VarianceBuilder<'a> {
     pub fn finalize(self) -> Option<HashBinary> {
         const SALT: &[u8; 1] = &[0u8; 1];
         if self.has_variance() {
-            let mut hash = Blake2b128::new();
+            let mut hasher = Xxh3::new();
             for (name, value) in self.values.iter() {
-                hash.update(name.as_bytes());
-                hash.update(SALT);
-                hash.update(value);
-                hash.update(SALT);
+                hasher.update(name.as_bytes());
+                hasher.update(SALT);
+                hasher.update(value);
+                hasher.update(SALT);
             }
-            Some(hash.finalize().into())
+            let hash = hasher.digest128();
+            Some(hash.to_le_bytes())
         } else {
             None
         }

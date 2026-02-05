@@ -16,10 +16,10 @@
 
 use super::*;
 
-use blake2::{Blake2b, Digest};
 use http::Extensions;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use xxhash_rust::xxh3::Xxh3;
 
 // 16-byte / 128-bit key: large enough to avoid collision
 const KEY_SIZE: usize = 16;
@@ -63,10 +63,11 @@ pub trait CacheHashKey {
     fn combined_bin(&self) -> HashBinary {
         let key = self.primary_bin();
         if let Some(v) = self.variance_bin() {
-            let mut hasher = Blake2b128::new();
-            hasher.update(key);
-            hasher.update(v);
-            hasher.finalize().into()
+            let mut hasher = Xxh3::new();
+            hasher.update(&key);
+            hasher.update(&v);
+            let hash = hasher.digest128();
+            hash.to_le_bytes()
         } else {
             // if there is no variance, combined_bin should return the same as primary_bin
             key
@@ -180,38 +181,37 @@ impl CacheHashKey for CompactCacheKey {
 }
 
 /*
- * We use blake2 hashing, which is faster and more secure, to replace md5.
- * We have not given too much thought on whether non-crypto hash can be safely
- * use because hashing performance is not critical.
- * Note: we should avoid hashes like ahash which does not have consistent output
- * across machines because it is designed purely for in memory hashtable
-*/
-
-// hash output: we use 128 bits (16 bytes) hash which will map to 32 bytes hex string
-pub(crate) type Blake2b128 = Blake2b<blake2::digest::consts::U16>;
+ * We use xxHash3, which is a fast non-cryptographic hash function.
+ * Cache keys don't require cryptographic security, and xxHash3 is ~10x faster
+ * than Blake2 while providing excellent collision resistance for cache use cases.
+ * We use the 128-bit variant (xxh3_128) for consistency with the previous Blake2b128.
+ * Note: we avoid hashes like ahash which don't have consistent output across
+ * machines because they're designed purely for in-memory hashtables.
+ */
 
 /// helper function: hash str to u8
 pub fn hash_u8(key: &str) -> u8 {
-    let mut hasher = Blake2b128::new();
-    hasher.update(key);
-    let raw = hasher.finalize();
-    raw[0]
+    let mut hasher = Xxh3::new();
+    hasher.update(key.as_bytes());
+    let hash = hasher.digest128();
+    (hash & 0xFF) as u8
 }
 
 /// helper function: hash key (String or Bytes) to [HashBinary]
 pub fn hash_key<K: AsRef<[u8]>>(key: K) -> HashBinary {
-    let mut hasher = Blake2b128::new();
+    let mut hasher = Xxh3::new();
     hasher.update(key.as_ref());
-    let raw = hasher.finalize();
-    raw.into()
+    let hash = hasher.digest128();
+    hash.to_le_bytes()
 }
 
 impl CacheKey {
-    fn primary_hasher(&self) -> Blake2b128 {
-        let mut hasher = Blake2b128::new();
+    fn primary_hash(&self) -> HashBinary {
+        let mut hasher = Xxh3::new();
         hasher.update(&self.namespace);
         hasher.update(&self.primary);
-        hasher
+        let hash = hasher.digest128();
+        hash.to_le_bytes()
     }
 
     /// Create a default [CacheKey] from a request, which just takes its URI as the primary key.
@@ -271,7 +271,7 @@ impl CacheHashKey for CacheKey {
         if let Some(primary_bin_override) = self.primary_bin_override {
             primary_bin_override
         } else {
-            self.primary_hasher().finalize().into()
+            self.primary_hash()
         }
     }
 
@@ -299,7 +299,7 @@ mod tests {
             extensions: Extensions::new(),
         };
         let hash = key.primary();
-        assert_eq!(hash, "ac10f2aef117729f8dad056b3059eb7e");
+        assert_eq!(hash, "3393a146a6429236209bd346d394feb9");
         assert!(key.variance().is_none());
         assert_eq!(key.combined(), hash);
         let compact = key.to_compact();
@@ -350,16 +350,16 @@ mod tests {
             extensions: Extensions::new(),
         };
         let hash = key.primary();
-        assert_eq!(hash, "ac10f2aef117729f8dad056b3059eb7e");
+        assert_eq!(hash, "3393a146a6429236209bd346d394feb9");
         assert_eq!(key.variance().unwrap(), "00000000000000000000000000000000");
-        assert_eq!(key.combined(), "004174d3e75a811a5b44c46b3856f3ee");
+        assert_eq!(key.combined(), "b03c278e7fd4cc0630a352947348e37f");
         let compact = key.to_compact();
-        assert_eq!(compact.primary(), "ac10f2aef117729f8dad056b3059eb7e");
+        assert_eq!(compact.primary(), "3393a146a6429236209bd346d394feb9");
         assert_eq!(
             compact.variance().unwrap(),
             "00000000000000000000000000000000"
         );
-        assert_eq!(compact.combined(), "004174d3e75a811a5b44c46b3856f3ee");
+        assert_eq!(compact.combined(), "b03c278e7fd4cc0630a352947348e37f");
     }
 
     #[test]
@@ -367,22 +367,22 @@ mod tests {
         let key = CacheKey {
             namespace: Vec::new(),
             primary: b"saaaad".to_vec(),
-            primary_bin_override: str2hex("ac10f2aef117729f8dad056b3059eb7e"),
+            primary_bin_override: str2hex("3393a146a6429236209bd346d394feb9"),
             variance: Some([0u8; 16]),
             user_tag: "1".into(),
             extensions: Extensions::new(),
         };
         let hash = key.primary();
-        assert_eq!(hash, "ac10f2aef117729f8dad056b3059eb7e");
+        assert_eq!(hash, "3393a146a6429236209bd346d394feb9");
         assert_eq!(key.variance().unwrap(), "00000000000000000000000000000000");
-        assert_eq!(key.combined(), "004174d3e75a811a5b44c46b3856f3ee");
+        assert_eq!(key.combined(), "b03c278e7fd4cc0630a352947348e37f");
         let compact = key.to_compact();
-        assert_eq!(compact.primary(), "ac10f2aef117729f8dad056b3059eb7e");
+        assert_eq!(compact.primary(), "3393a146a6429236209bd346d394feb9");
         assert_eq!(
             compact.variance().unwrap(),
             "00000000000000000000000000000000"
         );
-        assert_eq!(compact.combined(), "004174d3e75a811a5b44c46b3856f3ee");
+        assert_eq!(compact.combined(), "b03c278e7fd4cc0630a352947348e37f");
     }
 
     #[test]
