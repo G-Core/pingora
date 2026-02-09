@@ -30,6 +30,7 @@ use crate::tls::ext::{
 use crate::tls::ssl::SslCurve;
 use crate::tls::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode, SslVersion};
 use crate::tls::x509::store::X509StoreBuilder;
+use crate::tls::x509::verify::X509VerifyFlags;
 use crate::upstreams::peer::{Peer, ALPN};
 
 pub type TlsConnector = SslConnector;
@@ -171,6 +172,10 @@ where
         for ca in &***ca_list {
             store_builder.add_cert(ca.clone()).unwrap();
         }
+        // Enable partial chain verification to allow intermediate CAs as trust anchors.
+        // This is needed when proxy_ssl_ca contains an intermediate certificate (like Let's Encrypt E8)
+        // rather than a root CA.
+        store_builder.set_flags(X509VerifyFlags::PARTIAL_CHAIN);
         ssl_set_verify_cert_store(&mut ssl_conf, &store_builder.build())
             .or_err(InternalError, "failed to load cert store")?;
     }
