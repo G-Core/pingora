@@ -121,11 +121,28 @@ pub type TlsAcceptCallbacks = Box<dyn TlsAccept + Send + Sync>;
 struct TransportStackBuilder {
     l4: ServerAddress,
     tls: Option<TlsSettings>,
+    /// Cached built TLS acceptor so `build_for_thread` can be called multiple times
+    /// (once per NoSteal thread) without consuming `tls` on the first call.
+    tls_built: Option<Arc<Acceptor>>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Option<Arc<dyn ConnectionFilter>>,
 }
 
 impl TransportStackBuilder {
+    /// Build or return the cached `Arc<Acceptor>`. Takes `self.tls` on first call.
+    fn build_tls(&mut self) -> Option<Arc<Acceptor>> {
+        if let Some(built) = &self.tls_built {
+            return Some(built.clone());
+        }
+        if let Some(settings) = self.tls.take() {
+            let built = Arc::new(settings.build());
+            self.tls_built = Some(built.clone());
+            Some(built)
+        } else {
+            None
+        }
+    }
+
     pub async fn build(
         &mut self,
         #[cfg(unix)] upgrade_listeners: Option<ListenFds>,
@@ -147,7 +164,37 @@ impl TransportStackBuilder {
 
         Ok(TransportStack {
             l4,
-            tls: self.tls.take().map(|tls| Arc::new(tls.build())),
+            tls: self.build_tls(),
+        })
+    }
+
+    /// Build a [`TransportStack`] for `thread_idx` using a per-thread `SO_REUSEPORT` socket.
+    ///
+    /// TCP endpoints get an independent socket per thread; UDS endpoints fall back to the
+    /// shared-fd behavior. May be called multiple times (once per thread) without consuming
+    /// the TLS settings.
+    #[cfg(unix)]
+    pub async fn build_for_thread(
+        &mut self,
+        upgrade_listeners: Option<ListenFds>,
+        thread_idx: usize,
+    ) -> Result<TransportStack> {
+        let mut builder = ListenerEndpoint::builder();
+
+        builder.listen_addr(self.l4.clone());
+
+        #[cfg(feature = "connection_filter")]
+        if let Some(filter) = &self.connection_filter {
+            builder.connection_filter(filter.clone());
+        }
+
+        let l4 = builder
+            .listen_for_thread(upgrade_listeners, thread_idx)
+            .await?;
+
+        Ok(TransportStack {
+            l4,
+            tls: self.build_tls(),
         })
     }
 }
@@ -299,6 +346,7 @@ impl Listeners {
         self.stacks.push(TransportStackBuilder {
             l4,
             tls,
+            tls_built: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: self.connection_filter.clone(),
         })
@@ -321,6 +369,25 @@ impl Listeners {
             stacks.push(new_stack);
         }
 
+        Ok(stacks)
+    }
+
+    /// Build one [`TransportStack`] per listener for `thread_idx`.
+    ///
+    /// Each TCP endpoint gets its own `SO_REUSEPORT` socket; UDS endpoints share a single fd.
+    #[cfg(unix)]
+    pub(crate) async fn build_for_thread(
+        &mut self,
+        upgrade_listeners: Option<ListenFds>,
+        thread_idx: usize,
+    ) -> Result<Vec<TransportStack>> {
+        let mut stacks = Vec::with_capacity(self.stacks.len());
+        for b in self.stacks.iter_mut() {
+            let stack = b
+                .build_for_thread(upgrade_listeners.clone(), thread_idx)
+                .await?;
+            stacks.push(stack);
+        }
         Ok(stacks)
     }
 

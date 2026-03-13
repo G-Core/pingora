@@ -276,6 +276,95 @@ async fn bind(addr: &ServerAddress) -> Result<Listener> {
     }
 }
 
+/// Create a TCP socket with `SO_REUSEADDR` and `SO_REUSEPORT` set, ready for `bind()`.
+#[cfg(unix)]
+fn make_reuseport_socket(sock_addr: SocketAddr) -> Result<TcpSocket> {
+    let listener_socket = match sock_addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4(),
+        SocketAddr::V6(_) => TcpSocket::new_v6(),
+    }
+    .or_err_with(BindError, || format!("fail to create socket for {sock_addr}"))?;
+
+    listener_socket
+        .set_reuseaddr(true)
+        .or_err(BindError, "fail to set_reuseaddr(true)")?;
+    socket2::SockRef::from(&listener_socket)
+        .set_reuse_port(true)
+        .or_err(BindError, "failed to set SO_REUSEPORT")?;
+
+    Ok(listener_socket)
+}
+
+/// Bind a TCP socket with `SO_REUSEPORT` for per-thread listeners in NoSteal mode.
+///
+/// Each thread gets its own listening socket on the same address. The kernel
+/// load-balances incoming connections across all sockets via the 4-tuple hash.
+#[cfg(unix)]
+pub(crate) async fn bind_tcp_reuseport(addr: &str) -> Result<Listener> {
+    let sock_addr = addr
+        .to_socket_addrs()
+        .or_err_with(BindError, || format!("Invalid listen address {addr}"))?
+        .next()
+        .ok_or_else(|| {
+            pingora_error::Error::explain(
+                BindError,
+                format!("listen address {addr} resolved to no socket addresses"),
+            )
+        })?;
+
+    let listener_socket = make_reuseport_socket(sock_addr)?;
+
+    listener_socket
+        .bind(sock_addr)
+        .or_err_with(BindError, || format!("bind() failed on {addr}"))?;
+
+    Ok(listener_socket
+        .listen(LISTENER_BACKLOG)
+        .or_err(BindError, "listen() failed")?
+        .into())
+}
+
+/// Like [`bind_tcp_reuseport`] but retries on `EADDRINUSE` for up to ~6 seconds (60 × 100 ms).
+///
+/// Used during first-time migration from a single-socket to per-thread socket configuration
+/// when the old process still holds its listening socket without `SO_REUSEPORT`.
+#[cfg(unix)]
+async fn bind_tcp_reuseport_with_retry(addr: &str) -> Result<Listener> {
+    const MAX_TRY: usize = 60; // 60 × 100 ms = 6 s total wait
+    let mut try_count = 0;
+    loop {
+        let sock_addr = addr
+            .to_socket_addrs()
+            .or_err_with(BindError, || format!("Invalid listen address {addr}"))?
+            .next()
+            .ok_or_else(|| {
+                pingora_error::Error::explain(
+                    BindError,
+                    format!("listen address {addr} resolved to no socket addresses"),
+                )
+            })?;
+
+        let listener_socket = make_reuseport_socket(sock_addr)?;
+
+        match listener_socket.bind(sock_addr) {
+            Ok(()) => {
+                return Ok(listener_socket
+                    .listen(LISTENER_BACKLOG)
+                    .or_err(BindError, "listen() failed")?
+                    .into());
+            }
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::AddrInUse || try_count >= MAX_TRY {
+                    return Err(e).or_err_with(BindError, || format!("bind() failed on {addr}"));
+                }
+                try_count += 1;
+                warn!("{addr} is in use (first-time migration to per-thread sockets), will retry");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ListenerEndpoint {
     listen_addr: ServerAddress,
@@ -334,6 +423,150 @@ impl ListenerEndpointBuilder {
         } else {
             // not found, no fd table
             bind(&listen_addr).await?
+        };
+
+        #[cfg(feature = "connection_filter")]
+        let connection_filter = self
+            .connection_filter
+            .unwrap_or_else(|| Arc::new(AcceptAllFilter));
+
+        Ok(ListenerEndpoint {
+            listen_addr,
+            listener: Arc::new(listener),
+            #[cfg(feature = "connection_filter")]
+            connection_filter,
+        })
+    }
+
+    /// Build a [`ListenerEndpoint`] pinned to `thread_idx` in NoSteal mode.
+    ///
+    /// Uses key `"{addr}#{thread_idx}"` in the FD table for graceful upgrades so each thread
+    /// inherits its own listening socket. Binds a new `SO_REUSEPORT` socket when not found.
+    ///
+    /// For UDS endpoints, falls back to the regular shared-fd behavior since UDS does not
+    /// benefit from per-thread sockets.
+    ///
+    /// **Note:** `start_service()` calls this sequentially (thread 0 before thread 1 etc.),
+    /// which is important for the first-time migration logic that closes the inherited fd on
+    /// thread 0 before other threads attempt to rebind.
+    #[cfg(unix)]
+    pub async fn listen_for_thread(
+        self,
+        fds: Option<ListenFds>,
+        thread_idx: usize,
+    ) -> Result<ListenerEndpoint> {
+        let listen_addr = self.listen_addr.expect("no listen addr set");
+
+        // UDS doesn't benefit from per-thread sockets — fall back to shared-fd path.
+        if let ServerAddress::Uds(_, _) = &listen_addr {
+            let mut b = Self::new();
+            b.listen_addr(listen_addr);
+            #[cfg(feature = "connection_filter")]
+            if let Some(filter) = self.connection_filter {
+                b.connection_filter(filter);
+            }
+            return b.listen(fds).await;
+        }
+
+        let addr_str = listen_addr.as_ref();
+        let thread_key = format!("{}#{}", addr_str, thread_idx);
+
+        // Two possible outcomes determined while holding the lock:
+        enum Action {
+            /// Reuse an inherited fd. `register_key` means we also need to store the
+            /// per-thread key in the table (SO_REUSEPORT migration path for thread 0).
+            UseInherited { fd: i32, register_key: bool },
+            /// Bind a fresh SO_REUSEPORT socket. `retry` means retry on EADDRINUSE
+            /// (first-time migration: old socket without SO_REUSEPORT is still bound).
+            Bind { retry: bool },
+        }
+
+        let listener = if let Some(fds_table) = fds {
+            let action = {
+                let mut table = fds_table.lock().await;
+                if let Some(&fd) = table.get(&thread_key) {
+                    // Normal path: inherited per-thread fd from previous process run.
+                    Action::UseInherited { fd, register_key: false }
+                } else if let Some(&old_fd) = table.get(addr_str) {
+                    // First-time migration: found old-style single-socket fd.
+                    let has_reuseport = {
+                        // SAFETY: `old_fd` is a valid open file descriptor pointing to a TCP
+                        // listening socket inherited via SCM_RIGHTS. We wrap it in TcpStream
+                        // only to call socket2::SockRef::reuse_port(); ManuallyDrop prevents
+                        // the Drop impl from closing the fd so it remains usable by callers.
+                        let std_sock =
+                            unsafe { std::net::TcpStream::from_raw_fd(old_fd) };
+                        let r = socket2::SockRef::from(&std_sock)
+                            .reuse_port()
+                            .unwrap_or(false);
+                        let _ = std::mem::ManuallyDrop::new(std_sock);
+                        r
+                    };
+                    if has_reuseport && thread_idx == 0 {
+                        // Thread 0 reuses the inherited SO_REUSEPORT socket directly.
+                        // Defer table.add() to outside the lock so thread_key can be moved
+                        // (not cloned) into the table.add() call in the match arm below.
+                        Action::UseInherited { fd: old_fd, register_key: true }
+                    } else if has_reuseport {
+                        // Threads 1-N bind new SO_REUSEPORT sockets alongside the inherited one.
+                        // This succeeds immediately since the existing socket also has SO_REUSEPORT.
+                        Action::Bind { retry: false }
+                    } else {
+                        // Inherited socket lacks SO_REUSEPORT (true first-time migration).
+                        // Thread 0 closes our inherited copy to help free the port sooner.
+                        // Since start_service() calls this sequentially, thread 0 always runs
+                        // before threads 1-N, so by the time they run the fd is already closed.
+                        if thread_idx == 0 {
+                            // SAFETY: `old_fd` is a valid open fd inherited via SCM_RIGHTS.
+                            // We intentionally drop/close our copy here to release the port.
+                            // The old process holds its own independent copy unaffected by this.
+                            drop(unsafe { std::net::TcpStream::from_raw_fd(old_fd) });
+                            // Remove the stale entry so threads 1-N don't access the now-closed
+                            // fd. Without this, a thread could call from_raw_fd on a closed fd
+                            // that the OS may have already reused, which is UB.
+                            table.remove(addr_str);
+                            warn!(
+                                "Inherited socket for {addr_str} lacks SO_REUSEPORT \
+                                 (first-time migration to per-thread sockets). \
+                                 Closing inherited fd and rebinding. \
+                                 Brief connection interruption expected."
+                            );
+                        }
+                        Action::Bind { retry: true }
+                    }
+                } else {
+                    // No inherited fd — fresh start.
+                    Action::Bind { retry: false }
+                }
+            }; // lock released here
+
+            match action {
+                Action::UseInherited { fd, register_key } => {
+                    if register_key {
+                        // Re-acquire lock to register under the per-thread key and remove the
+                        // old-style "addr" entry. Without the removal, serialize() would send
+                        // old_fd twice (as "addr" and "addr#0"), causing a fd leak in the next
+                        // process that receives it but never uses the "addr" copy.
+                        let mut table = fds_table.lock().await;
+                        table.add(thread_key, fd);
+                        table.remove(addr_str);
+                    }
+                    from_raw_fd(&listen_addr, fd)?
+                }
+                Action::Bind { retry } => {
+                    let l = if retry {
+                        bind_tcp_reuseport_with_retry(addr_str).await?
+                    } else {
+                        bind_tcp_reuseport(addr_str).await?
+                    };
+                    let mut table = fds_table.lock().await;
+                    table.add(thread_key, l.as_raw_fd());
+                    l
+                }
+            }
+        } else {
+            // No fd table (e.g. tests or non-upgrade start).
+            bind_tcp_reuseport(addr_str).await?
         };
 
         #[cfg(feature = "connection_filter")]

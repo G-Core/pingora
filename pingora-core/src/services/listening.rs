@@ -34,11 +34,12 @@ use crate::services::Service as ServiceTrait;
 use async_trait::async_trait;
 use log::{debug, error, info};
 use pingora_error::Result;
-use pingora_runtime::current_handle;
+use pingora_runtime::{current_handle, current_handle_at, current_thread_count};
 use pingora_timeout::timeout;
 use std::fs::Permissions;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::runtime::Handle;
 
 /// The type of service that is associated with a list of listening endpoints and a particular application
 pub struct Service<A> {
@@ -186,6 +187,13 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
         mut stack: TransportStack,
         mut shutdown: ShutdownWatch,
     ) {
+        // Determine once whether we're in NoSteal mode to avoid a thread-local lookup
+        // on every accepted connection.
+        // In NoSteal mode, stay on the accepting thread for better cache locality:
+        // the socket is already in this thread's epoll fd, so no cross-thread re-registration.
+        // In Steal mode, dispatch randomly (work-stealing handles load balancing).
+        let is_no_steal = current_thread_count().is_some();
+
         // the accept loop, until the system is shutting down
         loop {
             let new_io = tokio::select! { // TODO: consider biased for perf reason?
@@ -211,7 +219,12 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
                 Ok(io) => {
                     let app = app_logic.clone();
                     let shutdown = shutdown.clone();
-                    current_handle().spawn(async move {
+                    let handle = if is_no_steal {
+                        Handle::current()
+                    } else {
+                        current_handle()
+                    };
+                    handle.spawn(async move {
                         let peer_addr = io.peer_addr();
                         match timeout(Duration::from_secs(60), io.handshake()).await {
                             Ok(handshake) => {
@@ -264,6 +277,44 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
         shutdown: ShutdownWatch,
         listeners_per_fd: usize,
     ) {
+        let app_logic = Arc::new(
+            self.app_logic
+                .take()
+                .expect("can only start_service() once"),
+        );
+        let mut handlers = Vec::new();
+
+        // On Unix with NoSteal runtime: build one SO_REUSEPORT socket per thread per listener.
+        // Each accept task is pinned to its thread, giving true per-thread accept parallelism
+        // with zero cross-thread epoll contention.
+        #[cfg(unix)]
+        if let Some(n_threads) = current_thread_count() {
+            // listeners_per_fd is ignored — multiple tasks per socket don't help in NoSteal mode
+            // since each thread has its own dedicated socket.
+            for thread_idx in 0..n_threads {
+                let endpoints = self
+                    .listeners
+                    .build_for_thread(fds.clone(), thread_idx)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("Failed to build listeners for thread {thread_idx}: {e}")
+                    });
+                let handle = current_handle_at(thread_idx);
+                for endpoint in endpoints {
+                    let app = app_logic.clone();
+                    let sd = shutdown.clone();
+                    handlers.push(handle.spawn(async move {
+                        Self::run_endpoint(app, endpoint, sd).await;
+                    }));
+                }
+            }
+            futures::future::join_all(handlers).await;
+            self.listeners.cleanup();
+            app_logic.cleanup().await;
+            return;
+        }
+
+        // Steal mode (or non-Unix): existing behavior unchanged.
         let runtime = current_handle();
         let endpoints = self
             .listeners
@@ -274,25 +325,15 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
             .await
             .expect("Failed to build listeners");
 
-        let app_logic = self
-            .app_logic
-            .take()
-            .expect("can only start_service() once");
-        let app_logic = Arc::new(app_logic);
-
-        let mut handlers = Vec::new();
-
         endpoints.into_iter().for_each(|endpoint| {
             for _ in 0..listeners_per_fd {
                 let shutdown = shutdown.clone();
                 let my_app_logic = app_logic.clone();
-                let endpoint = endpoint.clone();
+                let ep = endpoint.clone();
 
-                let jh = runtime.spawn(async move {
-                    Self::run_endpoint(my_app_logic, endpoint, shutdown).await;
-                });
-
-                handlers.push(jh);
+                handlers.push(runtime.spawn(async move {
+                    Self::run_endpoint(my_app_logic, ep, shutdown).await;
+                }));
             }
         });
 

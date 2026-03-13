@@ -21,7 +21,6 @@ use nix::sys::socket::{self, AddressFamily, RecvMsg, SockFlag, SockType, UnixAdd
 use nix::sys::stat;
 use nix::{Error, NixPath};
 use std::collections::HashMap;
-use std::io::Write;
 #[cfg(target_os = "linux")]
 use std::io::{IoSlice, IoSliceMut};
 use std::os::unix::io::RawFd;
@@ -50,6 +49,10 @@ impl Fds {
         self.map.get(bind)
     }
 
+    pub fn remove(&mut self, bind: &str) {
+        self.map.remove(bind);
+    }
+
     pub fn serialize(&self) -> (Vec<String>, Vec<RawFd>) {
         self.map.iter().map(|(key, val)| (key.clone(), val)).unzip()
     }
@@ -66,29 +69,22 @@ impl Fds {
         P: ?Sized + NixPath + std::fmt::Display,
     {
         let (vec_key, vec_fds) = self.serialize();
-        let mut ser_buf: [u8; 2048] = [0; 2048];
-        let ser_key_size = serialize_vec_string(&vec_key, &mut ser_buf);
-        send_fds_to(vec_fds, &ser_buf[..ser_key_size], path, None)
+        send_fds_chunked_to(&vec_key, &vec_fds, path, None)
     }
 
     pub fn get_from_sock<P>(&mut self, path: &P) -> Result<(), Error>
     where
         P: ?Sized + NixPath + std::fmt::Display,
     {
-        let mut de_buf: [u8; 2048] = [0; 2048];
-        let (fds, bytes) = get_fds_from(path, &mut de_buf, None)?;
-        let keys = deserialize_vec_string(&de_buf[..bytes])?;
+        let (fds, keys) = recv_fds_chunked_from(path, None)?;
         self.deserialize(keys, fds);
         Ok(())
     }
 }
 
-fn serialize_vec_string(vec_string: &[String], mut buf: &mut [u8]) -> usize {
-    // There are many ways to do this. Serde is probably the way to go
-    // But let's start with something simple: space separated strings
-    let joined = vec_string.join(" ");
-    // TODO: check the buf is large enough
-    buf.write(joined.as_bytes()).unwrap()
+fn serialize_vec_string(vec_string: &[String]) -> Vec<u8> {
+    // Space-separated serialization. Uses dynamic allocation to avoid silent truncation.
+    vec_string.join(" ").into_bytes()
 }
 
 fn deserialize_vec_string(buf: &[u8]) -> Result<Vec<String>, Error> {
@@ -96,6 +92,8 @@ fn deserialize_vec_string(buf: &[u8]) -> Result<Vec<String>, Error> {
     Ok(joined.split_ascii_whitespace().map(String::from).collect())
 }
 
+// Kept for backward compatibility and unit tests; production code uses recv_fds_chunked_from.
+#[cfg_attr(not(test), allow(dead_code))]
 #[cfg(target_os = "linux")]
 pub fn get_fds_from<P>(
     path: &P,
@@ -106,7 +104,7 @@ where
     P: ?Sized + NixPath + std::fmt::Display,
 {
     let max_retry = max_retry.unwrap_or(MAX_RETRY);
-    const MAX_FDS: usize = 32;
+    const MAX_FDS: usize = 1024;
 
     let listen_fd = socket::socket(
         AddressFamily::Unix,
@@ -196,6 +194,8 @@ where
 const MAX_RETRY: usize = 5;
 #[cfg(target_os = "linux")]
 const RETRY_INTERVAL: time::Duration = time::Duration::from_secs(1);
+/// Linux kernel limit (`SCM_MAX_FD`): maximum FDs per `SCM_RIGHTS` control message.
+const MAX_FDS_PER_MSG: usize = 253;
 
 #[cfg(target_os = "linux")]
 fn accept_with_retry_timeout(listen_fd: i32, max_retry: usize) -> Result<i32, Error> {
@@ -225,6 +225,8 @@ fn accept_with_retry_timeout(listen_fd: i32, max_retry: usize) -> Result<i32, Er
     }
 }
 
+// Kept for backward compatibility and unit tests; production code uses send_fds_chunked_to.
+#[cfg_attr(not(test), allow(dead_code))]
 #[cfg(target_os = "linux")]
 pub fn send_fds_to<P>(
     fds: Vec<RawFd>,
@@ -344,6 +346,254 @@ where
     Ok(0)
 }
 
+/// Like [`send_fds_to`] but sends FDs in chunks of at most [`MAX_FDS_PER_MSG`] per message,
+/// staying within the Linux `SCM_RIGHTS` (`SCM_MAX_FD = 253`) limit.
+///
+/// Each message carries a key-subset in the iov payload and the matching FDs in `SCM_RIGHTS`.
+/// The receiver detects end-of-stream when the sender closes the connection (bytes == 0 in
+/// `recvmsg`). Old receivers that call `get_fds_from` only once will still work: they receive
+/// the first chunk and see EOF on the next call, which is indistinguishable from the old
+/// single-message protocol.
+#[cfg(target_os = "linux")]
+fn send_fds_chunked_to<P>(
+    keys: &[String],
+    fds: &[RawFd],
+    path: &P,
+    max_retry: Option<usize>,
+) -> Result<usize, Error>
+where
+    P: ?Sized + NixPath + std::fmt::Display,
+{
+    debug_assert_eq!(keys.len(), fds.len());
+    let max_retry = max_retry.unwrap_or(MAX_RETRY);
+    const MAX_NONBLOCKING_POLLS: usize = 20;
+    const NONBLOCKING_POLL_INTERVAL: time::Duration = time::Duration::from_millis(500);
+
+    let send_fd = socket::socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_NONBLOCK,
+        None,
+    )?;
+    let unix_addr = UnixAddr::new(path)?;
+    let mut retried = 0;
+    let mut nonblocking_polls = 0;
+
+    // Connect with the same retry logic as send_fds_to.
+    let conn_result: Result<(), Error> = loop {
+        match socket::connect(send_fd, &unix_addr) {
+            Ok(_) => break Ok(()),
+            Err(e) => match e {
+                Errno::ENOENT | Errno::ECONNREFUSED | Errno::EACCES => {
+                    retried += 1;
+                    if retried > max_retry {
+                        error!(
+                            "Max retry: {} reached. Giving up sending socket to: {}, error: {:?}",
+                            max_retry, path, e
+                        );
+                        break Err(e);
+                    }
+                    warn!("server not ready, will try again in {RETRY_INTERVAL:?}");
+                    thread::sleep(RETRY_INTERVAL);
+                }
+                Errno::EINPROGRESS => {
+                    nonblocking_polls += 1;
+                    if nonblocking_polls >= MAX_NONBLOCKING_POLLS {
+                        error!(
+                            "Connect() not ready after retries when sending socket to: {path}"
+                        );
+                        break Err(e);
+                    }
+                    warn!("Connect() not ready, will try again in {NONBLOCKING_POLL_INTERVAL:?}");
+                    thread::sleep(NONBLOCKING_POLL_INTERVAL);
+                }
+                _ => {
+                    error!("Error sending socket to: {path}, error: {e:?}");
+                    break Err(e);
+                }
+            },
+        }
+    };
+
+    let result = match conn_result {
+        Ok(()) => {
+            let mut total_sent = 0;
+            let mut send_err: Option<Error> = None;
+            // If fds is empty we send no messages; closing the connection is sufficient for
+            // the receiver to see EOF and return an empty result.
+            for (key_chunk, fd_chunk) in
+                keys.chunks(MAX_FDS_PER_MSG).zip(fds.chunks(MAX_FDS_PER_MSG))
+            {
+                let payload = serialize_vec_string(key_chunk);
+                let io_vec = [IoSlice::new(&payload); 1];
+                let scm = socket::ControlMessage::ScmRights(fd_chunk);
+                let cmsg = [scm; 1];
+                let mut nb_polls = nonblocking_polls;
+                let sent = loop {
+                    match socket::sendmsg(
+                        send_fd,
+                        &io_vec,
+                        &cmsg,
+                        socket::MsgFlags::empty(),
+                        None::<&UnixAddr>,
+                    ) {
+                        Ok(n) => break Ok(n),
+                        Err(Errno::EAGAIN) => {
+                            nb_polls += 1;
+                            if nb_polls >= MAX_NONBLOCKING_POLLS {
+                                error!("Sendmsg() not ready after retries when sending socket to: {path}");
+                                break Err(Errno::EAGAIN);
+                            }
+                            warn!("Sendmsg() not ready, will try again in {NONBLOCKING_POLL_INTERVAL:?}");
+                            thread::sleep(NONBLOCKING_POLL_INTERVAL);
+                        }
+                        Err(e) => break Err(e),
+                    }
+                };
+                match sent {
+                    Ok(n) => total_sent += n,
+                    Err(e) => {
+                        send_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            match send_err {
+                None => Ok(total_sent),
+                Some(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    };
+
+    nix::unistd::close(send_fd).unwrap();
+    result
+}
+
+#[cfg(not(target_os = "linux"))]
+fn send_fds_chunked_to<P>(
+    _keys: &[String],
+    _fds: &[RawFd],
+    _path: &P,
+    _max_retry: Option<usize>,
+) -> Result<usize, Error>
+where
+    P: ?Sized + NixPath + std::fmt::Display,
+{
+    Ok(0)
+}
+
+/// Counterpart to [`send_fds_chunked_to`]: receives all chunks until EOF (sender closed),
+/// accumulating keys and FDs across messages.
+///
+/// Also compatible with old senders using a single `send_fds_to` call: they send one message
+/// then close, which from the receiver's perspective is identical to a one-chunk protocol.
+#[cfg(target_os = "linux")]
+fn recv_fds_chunked_from<P>(
+    path: &P,
+    max_retry: Option<usize>,
+) -> Result<(Vec<RawFd>, Vec<String>), Error>
+where
+    P: ?Sized + NixPath + std::fmt::Display,
+{
+    let max_retry = max_retry.unwrap_or(MAX_RETRY);
+
+    let listen_fd = socket::socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_NONBLOCK,
+        None,
+    )
+    .unwrap();
+    let unix_addr = UnixAddr::new(path).unwrap();
+    match nix::unistd::unlink(path) {
+        Ok(()) => debug!("unlink {} done", path),
+        Err(e) => debug!("unlink {} failed: {}", path, e),
+    }
+    socket::bind(listen_fd, &unix_addr).unwrap();
+    stat::fchmodat(
+        None,
+        path,
+        stat::Mode::all(),
+        stat::FchmodatFlags::FollowSymlink,
+    )
+    .unwrap();
+    socket::listen(listen_fd, 8).unwrap();
+
+    let conn_fd = match accept_with_retry_timeout(listen_fd, max_retry) {
+        Ok(fd) => fd,
+        Err(e) => {
+            error!("Giving up reading socket from: {path}, error: {e:?}");
+            if nix::unistd::close(listen_fd).is_ok() {
+                nix::unistd::unlink(path).unwrap();
+            }
+            return Err(e);
+        }
+    };
+
+    let mut all_fds: Vec<RawFd> = Vec::new();
+    let mut all_keys: Vec<String> = Vec::new();
+
+    // The accepted socket is blocking (standard accept() does not inherit SOCK_NONBLOCK).
+    // We loop recvmsg until bytes == 0, which signals EOF (sender closed the connection).
+    loop {
+        let mut payload_buf = [0u8; 32768];
+        let mut io_vec = [IoSliceMut::new(&mut payload_buf); 1];
+        let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS_PER_MSG]);
+        let msg: RecvMsg<UnixAddr> =
+            socket::recvmsg(conn_fd, &mut io_vec, Some(&mut cmsg_buf), socket::MsgFlags::empty())
+                .unwrap();
+
+        if msg.bytes == 0 {
+            // EOF: sender closed the connection.
+            break;
+        }
+
+        match deserialize_vec_string(&payload_buf[..msg.bytes]) {
+            Ok(keys) => {
+                all_keys.extend(keys);
+                for cmsg in msg.cmsgs() {
+                    if let socket::ControlMessageOwned::ScmRights(mut chunk_fds) = cmsg {
+                        all_fds.append(&mut chunk_fds);
+                    } else {
+                        warn!("Unexpected control message: {cmsg:?}");
+                    }
+                }
+            }
+            Err(e) => {
+                // Deserialization failed: skip this chunk entirely so keys and FDs stay
+                // in sync. Drain and close any kernel-duped FDs to avoid leaking them.
+                warn!("Failed to deserialize keys in chunk — skipping chunk FDs: {e:?}");
+                for cmsg in msg.cmsgs() {
+                    if let socket::ControlMessageOwned::ScmRights(chunk_fds) = cmsg {
+                        for fd in chunk_fds {
+                            let _ = nix::unistd::close(fd);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = nix::unistd::close(conn_fd);
+    if nix::unistd::close(listen_fd).is_ok() {
+        nix::unistd::unlink(path).unwrap();
+    }
+    Ok((all_fds, all_keys))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn recv_fds_chunked_from<P>(
+    _path: &P,
+    _max_retry: Option<usize>,
+) -> Result<(Vec<RawFd>, Vec<String>), Error>
+where
+    P: ?Sized + NixPath + std::fmt::Display,
+{
+    log::error!("Upgrade is not currently supported outside of Linux platforms");
+    Err(Errno::ECONNREFUSED)
+}
+
 #[cfg(test)]
 #[cfg(target_os = "linux")]
 mod tests {
@@ -384,9 +634,8 @@ mod tests {
     fn test_vec_string_serde() {
         init_log();
         let vec_str: Vec<String> = vec!["aaaa".to_string(), "bbb".to_string()];
-        let mut ser_buf: [u8; 1024] = [0; 1024];
-        let size = serialize_vec_string(&vec_str, &mut ser_buf);
-        let de_vec_string = deserialize_vec_string(&ser_buf[..size]).unwrap();
+        let ser_bytes = serialize_vec_string(&vec_str);
+        let de_vec_string = deserialize_vec_string(&ser_bytes).unwrap();
         assert_eq!(de_vec_string.len(), 2);
         assert_eq!(de_vec_string[0], "aaaa");
         assert_eq!(de_vec_string[1], "bbb");

@@ -102,6 +102,34 @@ pub fn current_handle() -> Handle {
     }
 }
 
+/// Returns `Some(N)` when called from a `NoSteal` runtime thread (N = thread pool size),
+/// or `None` when called from a `Steal` runtime or outside any runtime.
+pub fn current_thread_count() -> Option<usize> {
+    // safety: CURRENT_HANDLE is set (via get_or) in init_pools() before any tasks run on the
+    // thread. The OnceCell inside the Arc is populated by get_pools() → try_insert() before
+    // any Handle is handed out, so get() always returns Some once CURRENT_HANDLE is set.
+    CURRENT_HANDLE.get().map(|pools| pools.get().unwrap().len())
+}
+
+/// Returns the [`Handle`] for thread `index` in `NoSteal` mode.
+/// Panics if called outside a `NoSteal` runtime, if the pools are not yet initialized,
+/// or if `index` is out of bounds.
+pub fn current_handle_at(index: usize) -> Handle {
+    // safety: same invariant as current_handle() — CURRENT_HANDLE and the inner OnceCell are
+    // both populated before any tasks can run on this thread.
+    let pools = CURRENT_HANDLE
+        .get()
+        .expect("current_handle_at() called outside NoSteal runtime")
+        .get()
+        .unwrap();
+    assert!(
+        index < pools.len(),
+        "current_handle_at({index}) out of bounds (pool size = {})",
+        pools.len()
+    );
+    pools[index].clone()
+}
+
 type Control = (Sender<Duration>, JoinHandle<()>);
 type Pools = Arc<OnceCell<Box<[Handle]>>>;
 
