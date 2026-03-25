@@ -692,10 +692,14 @@ impl HttpSession {
             let resp_header = self.read_resp_header_parts().await?;
             let end_of_body = self.is_body_done();
             debug!("Response header: {resp_header:?}");
-            trace!(
-                "Raw Response header: {:?}",
-                str::from_utf8(self.get_headers_raw()).unwrap()
-            );
+            match str::from_utf8(self.get_headers_raw()) {
+                Ok(utf8_str) => {
+                    trace!("Raw Response header: {utf8_str}");
+                }
+                Err(e) => {
+                    trace!("Raw Response header error: {e}");
+                }
+            }
             Ok(HttpTask::Header(resp_header, end_of_body))
         } else if self.is_body_done() {
             // no body

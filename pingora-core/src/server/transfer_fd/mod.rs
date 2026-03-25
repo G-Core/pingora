@@ -399,9 +399,7 @@ where
                 Errno::EINPROGRESS => {
                     nonblocking_polls += 1;
                     if nonblocking_polls >= MAX_NONBLOCKING_POLLS {
-                        error!(
-                            "Connect() not ready after retries when sending socket to: {path}"
-                        );
+                        error!("Connect() not ready after retries when sending socket to: {path}");
                         break Err(e);
                     }
                     warn!("Connect() not ready, will try again in {NONBLOCKING_POLL_INTERVAL:?}");
@@ -421,8 +419,9 @@ where
             let mut send_err: Option<Error> = None;
             // If fds is empty we send no messages; closing the connection is sufficient for
             // the receiver to see EOF and return an empty result.
-            for (key_chunk, fd_chunk) in
-                keys.chunks(MAX_FDS_PER_MSG).zip(fds.chunks(MAX_FDS_PER_MSG))
+            for (key_chunk, fd_chunk) in keys
+                .chunks(MAX_FDS_PER_MSG)
+                .zip(fds.chunks(MAX_FDS_PER_MSG))
             {
                 let payload = serialize_vec_string(key_chunk);
                 let io_vec = [IoSlice::new(&payload); 1];
@@ -540,9 +539,13 @@ where
         let mut payload_buf = [0u8; 32768];
         let mut io_vec = [IoSliceMut::new(&mut payload_buf); 1];
         let mut cmsg_buf = nix::cmsg_space!([RawFd; MAX_FDS_PER_MSG]);
-        let msg: RecvMsg<UnixAddr> =
-            socket::recvmsg(conn_fd, &mut io_vec, Some(&mut cmsg_buf), socket::MsgFlags::empty())
-                .unwrap();
+        let msg: RecvMsg<UnixAddr> = socket::recvmsg(
+            conn_fd,
+            &mut io_vec,
+            Some(&mut cmsg_buf),
+            socket::MsgFlags::empty(),
+        )
+        .unwrap();
 
         if msg.bytes == 0 {
             // EOF: sender closed the connection.

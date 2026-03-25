@@ -283,7 +283,9 @@ fn make_reuseport_socket(sock_addr: SocketAddr) -> Result<TcpSocket> {
         SocketAddr::V4(_) => TcpSocket::new_v4(),
         SocketAddr::V6(_) => TcpSocket::new_v6(),
     }
-    .or_err_with(BindError, || format!("fail to create socket for {sock_addr}"))?;
+    .or_err_with(BindError, || {
+        format!("fail to create socket for {sock_addr}")
+    })?;
 
     listener_socket
         .set_reuseaddr(true)
@@ -486,7 +488,10 @@ impl ListenerEndpointBuilder {
                 let mut table = fds_table.lock().await;
                 if let Some(&fd) = table.get(&thread_key) {
                     // Normal path: inherited per-thread fd from previous process run.
-                    Action::UseInherited { fd, register_key: false }
+                    Action::UseInherited {
+                        fd,
+                        register_key: false,
+                    }
                 } else if let Some(&old_fd) = table.get(addr_str) {
                     // First-time migration: found old-style single-socket fd.
                     let has_reuseport = {
@@ -494,8 +499,7 @@ impl ListenerEndpointBuilder {
                         // listening socket inherited via SCM_RIGHTS. We wrap it in TcpStream
                         // only to call socket2::SockRef::reuse_port(); ManuallyDrop prevents
                         // the Drop impl from closing the fd so it remains usable by callers.
-                        let std_sock =
-                            unsafe { std::net::TcpStream::from_raw_fd(old_fd) };
+                        let std_sock = unsafe { std::net::TcpStream::from_raw_fd(old_fd) };
                         let r = socket2::SockRef::from(&std_sock)
                             .reuse_port()
                             .unwrap_or(false);
@@ -506,7 +510,10 @@ impl ListenerEndpointBuilder {
                         // Thread 0 reuses the inherited SO_REUSEPORT socket directly.
                         // Defer table.add() to outside the lock so thread_key can be moved
                         // (not cloned) into the table.add() call in the match arm below.
-                        Action::UseInherited { fd: old_fd, register_key: true }
+                        Action::UseInherited {
+                            fd: old_fd,
+                            register_key: true,
+                        }
                     } else if has_reuseport {
                         // Threads 1-N bind new SO_REUSEPORT sockets alongside the inherited one.
                         // This succeeds immediately since the existing socket also has SO_REUSEPORT.
