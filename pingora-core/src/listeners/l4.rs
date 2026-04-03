@@ -415,7 +415,11 @@ impl ListenerEndpointBuilder {
             let mut table = fds_table.lock().await;
 
             if let Some(fd) = table.get(addr_str) {
-                from_raw_fd(&listen_addr, *fd)?
+                let fd = *fd;
+                // Mark as claimed so close_unused_inherited() does not close this
+                // actively-used socket on a subsequent graceful upgrade.
+                table.mark_used(addr_str);
+                from_raw_fd(&listen_addr, fd)?
             } else {
                 // not found
                 let listener = bind(&listen_addr).await?;
@@ -554,9 +558,18 @@ impl ListenerEndpointBuilder {
                         // old-style "addr" entry. Without the removal, serialize() would send
                         // old_fd twice (as "addr" and "addr#0"), causing a fd leak in the next
                         // process that receives it but never uses the "addr" copy.
+                        // add() moves thread_key out of inherited_pending (no-op here since
+                        // thread_key was never in inherited_pending — it's a new key).
+                        // remove(addr_str) clears the original inherited_pending entry.
                         let mut table = fds_table.lock().await;
                         table.add(thread_key, fd);
                         table.remove(addr_str);
+                    } else {
+                        // FD is reused directly under its existing per-thread key.
+                        // add() is not called, so mark_used() prevents close_unused_inherited()
+                        // from treating this actively-used FD as stale.
+                        let mut table = fds_table.lock().await;
+                        table.mark_used(&thread_key);
                     }
                     from_raw_fd(&listen_addr, fd)?
                 }

@@ -259,7 +259,11 @@ impl Server {
                     .ok();
 
                 if let Some(fds) = &self.listen_fds {
-                    let fds = fds.lock().await;
+                    let mut fds = fds.lock().await;
+                    // Close inherited FDs that no listener claimed (ports removed from config).
+                    // This frees ports for other processes and prevents stale FDs from being
+                    // forwarded to the next upgrade generation.
+                    fds.close_unused_inherited();
                     info!("Trying to send socks");
                     // XXX: this is blocking IO
                     match fds.send_to_sock(self.configuration.as_ref().upgrade_sock.as_str()) {
@@ -553,7 +557,48 @@ impl Server {
                 .grace_period_seconds
                 .unwrap_or(EXIT_TIMEOUT);
             info!("Graceful shutdown: grace period {}s starts", exit_timeout);
-            thread::sleep(Duration::from_secs(exit_timeout));
+
+            // Re-register signal handlers on the still-running server_runtime.
+            // main_loop's select! consumed the originals; re-registering here allows
+            // a second SIGTERM/SIGINT/SIGQUIT to interrupt a long grace period early.
+            let fast_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            #[cfg(unix)]
+            {
+                let fast_exit = Arc::clone(&fast_exit);
+                server_runtime.get_handle().spawn(async move {
+                    let sigterm = unix::signal(unix::SignalKind::terminate());
+                    let sigint = unix::signal(unix::SignalKind::interrupt());
+                    let sigquit = unix::signal(unix::SignalKind::quit());
+                    match (sigterm, sigint, sigquit) {
+                        (Ok(mut sigterm), Ok(mut sigint), Ok(mut sigquit)) => {
+                            tokio::select! {
+                                _ = sigterm.recv() => {
+                                    info!("SIGTERM received during grace period, exiting early");
+                                }
+                                _ = sigint.recv() => {
+                                    info!("SIGINT received during grace period, exiting early");
+                                }
+                                _ = sigquit.recv() => {
+                                    info!("SIGQUIT received during grace period, exiting early");
+                                }
+                            }
+                            fast_exit.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        _ => {
+                            error!(
+                                "Failed to register signal handlers; \
+                                 grace period will not be interruptible by signals"
+                            );
+                        }
+                    }
+                });
+            }
+            for _ in 0..exit_timeout {
+                if fast_exit.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
             info!("Graceful shutdown: grace period ends");
         }
 
