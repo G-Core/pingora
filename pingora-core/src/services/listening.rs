@@ -292,6 +292,10 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
             // listeners_per_fd is ignored — multiple tasks per socket don't help in NoSteal mode
             // since each thread has its own dedicated socket.
             for thread_idx in 0..n_threads {
+                // build_for_thread() returns Ok even on bind failures (each failed
+                // listener is warned-and-skipped inside Listeners::build_for_thread).
+                // The unwrap_or_else therefore only fires for non-bind errors such as
+                // unexpected internal failures in TransportStackBuilder.
                 let endpoints = self
                     .listeners
                     .build_for_thread(fds.clone(), thread_idx)
@@ -299,6 +303,13 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
                     .unwrap_or_else(|e| {
                         panic!("Failed to build listeners for thread {thread_idx}: {e}")
                     });
+                // Log only on thread 0 to avoid n_threads identical messages.
+                if endpoints.is_empty() && thread_idx == 0 {
+                    error!(
+                        "Service '{}': all listeners failed to bind, no connections will be accepted",
+                        self.name
+                    );
+                }
                 let handle = current_handle_at(thread_idx);
                 for endpoint in endpoints {
                     let app = app_logic.clone();
@@ -315,6 +326,8 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
         }
 
         // Steal mode (or non-Unix): existing behavior unchanged.
+        // build() returns Ok even on bind failures (each failed listener is warned-and-skipped
+        // inside Listeners::build). The expect therefore only fires for non-bind errors.
         let runtime = current_handle();
         let endpoints = self
             .listeners
@@ -324,6 +337,13 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
             )
             .await
             .expect("Failed to build listeners");
+
+        if endpoints.is_empty() {
+            error!(
+                "Service '{}': all listeners failed to bind, no connections will be accepted",
+                self.name
+            );
+        }
 
         endpoints.into_iter().for_each(|endpoint| {
             for _ in 0..listeners_per_fd {

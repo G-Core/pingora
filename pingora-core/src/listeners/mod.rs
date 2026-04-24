@@ -80,6 +80,7 @@ use crate::protocols::{l4::socket::SocketAddr, tls::TlsRef, Stream};
 use crate::server::ListenFds;
 
 use async_trait::async_trait;
+use log::warn;
 use pingora_error::Result;
 use std::{any::Any, fs::Permissions, sync::Arc};
 
@@ -359,14 +360,16 @@ impl Listeners {
         let mut stacks = Vec::with_capacity(self.stacks.len());
 
         for b in self.stacks.iter_mut() {
-            let new_stack = b
+            match b
                 .build(
                     #[cfg(unix)]
                     upgrade_listeners.clone(),
                 )
-                .await?;
-
-            stacks.push(new_stack);
+                .await
+            {
+                Ok(new_stack) => stacks.push(new_stack),
+                Err(e) => warn!("Listener bind failed, skipping: {e}"),
+            }
         }
 
         Ok(stacks)
@@ -383,10 +386,16 @@ impl Listeners {
     ) -> Result<Vec<TransportStack>> {
         let mut stacks = Vec::with_capacity(self.stacks.len());
         for b in self.stacks.iter_mut() {
-            let stack = b
+            match b
                 .build_for_thread(upgrade_listeners.clone(), thread_idx)
-                .await?;
-            stacks.push(stack);
+                .await
+            {
+                Ok(stack) => stacks.push(stack),
+                // Log only on thread 0 — the same address fails identically on every thread
+                // in NoSteal mode, so logging once is sufficient to avoid n_threads duplicates.
+                Err(e) if thread_idx == 0 => warn!("Listener bind failed, skipping: {e}"),
+                Err(_) => {}
+            }
         }
         Ok(stacks)
     }
