@@ -81,6 +81,10 @@ impl Fds {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     pub fn serialize(&self) -> (Vec<String>, Vec<RawFd>) {
         // `inherited_pending` must be empty here — call `close_unused_inherited()` before
         // `send_to_sock()` to ensure stale inherited FDs are not forwarded.
@@ -179,11 +183,11 @@ where
     };
     socket::bind(listen_fd, &unix_addr).unwrap();
 
-    /* sock is created before we change user, need to give permission to all */
+    /* sock is created before we change user, need to give permission */
     stat::fchmodat(
         None,
         path,
-        stat::Mode::all(),
+        stat::Mode::from_bits_truncate(0o666),
         stat::FchmodatFlags::FollowSymlink,
     )
     .unwrap();

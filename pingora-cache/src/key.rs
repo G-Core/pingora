@@ -14,8 +14,6 @@
 
 //! Cache key
 
-use super::*;
-
 use http::Extensions;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter, Result as FmtResult};
@@ -212,18 +210,6 @@ impl CacheKey {
         hasher.update(&self.primary);
         let hash = hasher.digest128();
         hash.to_le_bytes()
-    }
-
-    /// Create a default [CacheKey] from a request, which just takes its URI as the primary key.
-    pub fn default(req_header: &ReqHeader) -> Self {
-        CacheKey {
-            namespace: Vec::new(),
-            primary: format!("{}", req_header.uri).into_bytes(),
-            primary_bin_override: None,
-            variance: None,
-            user_tag: "".into(),
-            extensions: Extensions::new(),
-        }
     }
 
     /// Create a new [CacheKey] from the given namespace, primary, and user_tag input.
