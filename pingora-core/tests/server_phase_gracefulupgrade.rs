@@ -63,11 +63,12 @@ fn test_server_execution_phase_monitor_graceful_upgrade() {
         phase.blocking_recv().unwrap(),
         ExecutionPhase::GracefulUpgradeTransferringFds,
     ));
+    // fast_exit setup in 3d2d6a2301b9b4c0c82208ea791667b57105387c e.g. on SIGQUIT
     // CLOSE_TIMEOUT (5 s) elapses so the new process can bind before we stop accepting.
-    assert!(matches!(
-        phase.blocking_recv().unwrap(),
-        ExecutionPhase::GracefulUpgradeCloseTimeout,
-    ));
+    //assert!(matches!(
+    //    phase.blocking_recv().unwrap(),
+    //    ExecutionPhase::GracefulUpgradeCloseTimeout,
+    //));
     assert!(matches!(
         phase.blocking_recv().unwrap(),
         ExecutionPhase::ShutdownStarted,

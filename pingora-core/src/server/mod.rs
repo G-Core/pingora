@@ -282,7 +282,6 @@ impl Server {
                         // Close inherited FDs that no listener claimed (ports removed from config).
                         // This frees ports for other processes and prevents stale FDs from being
                         // forwarded to the next upgrade generation.
-                        // fds.close_unused_inherited();
                         fds.close_unused_inherited();
                         info!("Trying to send socks");
                         match fds.send_to_sock(self.configuration.as_ref().upgrade_sock.as_str()) {
