@@ -22,10 +22,12 @@ use async_trait::async_trait;
 use log::{debug, error};
 use std::future::poll_fn;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::protocols::http::v2::server;
 use crate::protocols::http::ServerSession;
 use crate::protocols::Digest;
+use crate::protocols::IdleStream;
 use crate::protocols::Stream;
 use crate::protocols::ALPN;
 
@@ -63,6 +65,13 @@ pub trait ServerApp {
 pub struct HttpServerOptions {
     /// Allow HTTP/2 for plaintext.
     pub h2c: bool,
+
+    /// Force-close the downstream TCP socket if no bytes are received from the
+    /// peer for this duration. Applied as a wrapper at the entry of
+    /// [`HttpServerApp::process_new`], so it bounds H1 keep-alive idle, H2
+    /// "no new streams" idle, the H2 handshake window, and TLS-handshake-done
+    /// stalls in one mechanism. `None` keeps the legacy unbounded behaviour.
+    pub downstream_idle_timeout: Option<Duration>,
 
     #[doc(hidden)]
     pub force_custom: bool,
@@ -162,6 +171,19 @@ where
             .server_options()
             .as_ref()
             .map_or(false, |o| o.force_custom);
+
+        // Wrap the downstream stream with an idle-timeout adapter if configured.
+        // This applies before H1/H2 protocol selection, so it uniformly bounds
+        // H1 keep-alive idle, H2 between-streams idle, H2-preface stalls and
+        // any TLS-handshake-done-but-quiet attacker. The wrapper is transparent
+        // to all the downstream protocol code.
+        if let Some(idle_timeout) = self
+            .server_options()
+            .as_ref()
+            .and_then(|o| o.downstream_idle_timeout)
+        {
+            stream = Box::new(IdleStream::new(stream, idle_timeout));
+        }
 
         // try to read h2 preface
         if h2c && !custom {
