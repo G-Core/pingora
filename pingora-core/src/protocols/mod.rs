@@ -16,6 +16,7 @@
 
 mod digest;
 pub mod http;
+pub mod idle_stream;
 pub mod l4;
 pub mod raw_connect;
 pub mod tls;
@@ -26,6 +27,7 @@ pub use digest::{
     Digest, GetProxyDigest, GetSocketDigest, GetTimingDigest, ProtoDigest, SocketDigest,
     TimingDigest,
 };
+pub use idle_stream::IdleStream;
 pub use l4::ext::TcpKeepalive;
 pub use tls::ALPN;
 
