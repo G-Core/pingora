@@ -13,17 +13,10 @@
 // limitations under the License.
 
 //! `IdleStream`: `AsyncRead`/`AsyncWrite` wrapper that force-closes the
-//! underlying transport if no application-layer I/O moves in either direction
-//! for a configured duration.
+//! underlying transport on bidirectional inactivity.
 //!
-//! Writes reset the timer too: pingora's H1 proxy polls downstream read while
-//! writing the response body (`pingora-proxy/src/proxy_h1.rs` `read_body_or_idle`),
-//! so a read-only timer would tear the connection down mid-response.
-//!
-//! Applied as a wrapper at the entry of `process_new` for any
-//! `HttpServerApp` whose [`crate::apps::HttpServerOptions::downstream_idle_timeout`]
-//! is set, so it applies uniformly to H1, h2c, TLS-h2, and the H2-handshake
-//! window — no protocol-specific implementation needed.
+//! Per-byte hot path is a single `last_activity` field write; the tokio
+//! `Sleep` is only re-armed when it fires.
 
 use std::fmt::{self, Debug};
 use std::future::Future;
@@ -44,43 +37,48 @@ use crate::protocols::{
     TimingDigest, UniqueID, UniqueIDType, ALPN,
 };
 
-/// `Stream` wrapper that closes the underlying transport on bidirectional
-/// inactivity. Forwards every `IO`-trait method; the timer is checked /
-/// reset on `poll_read`, `poll_write`, `poll_write_vectored`, and `try_peek`.
+/// `Stream` wrapper closing the transport on bidirectional inactivity.
+/// Per-byte hot path is a `last_activity` field write — no timer-wheel touch.
 pub struct IdleStream {
     inner: Stream,
     idle_timeout: Duration,
     sleep: Pin<Box<Sleep>>,
+    last_activity: Instant,
 }
 
 impl IdleStream {
     /// Wrap `inner` with a peer-inactivity timeout of `idle_timeout`.
     pub fn new(inner: Stream, idle_timeout: Duration) -> Self {
+        let now = Instant::now();
         Self {
             inner,
             idle_timeout,
             sleep: Box::pin(tokio::time::sleep(idle_timeout)),
+            last_activity: now,
         }
     }
 }
 
 impl IdleStream {
-    fn reset_idle_timer(&mut self) {
-        let deadline = Instant::now() + self.idle_timeout;
-        self.sleep.as_mut().reset(deadline);
+    fn note_activity(&mut self) {
+        self.last_activity = Instant::now();
     }
-    /// Poll the idle timer. Registers a waker via `cx` so the future is re-
-    /// polled when the timer fires. Returns the timeout error to short-circuit
-    /// poll_read/write/flush/shutdown when the timer has already elapsed.
+
     fn check_idle_timer(&mut self, cx: &mut Context<'_>) -> Option<io::Error> {
         if self.sleep.as_mut().poll(cx).is_ready() {
-            Some(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "downstream idle timeout",
-            ))
-        } else {
-            None
+            let now = Instant::now();
+            if now.saturating_duration_since(self.last_activity) >= self.idle_timeout {
+                return Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "downstream idle timeout",
+                ));
+            }
+            // Spurious fire — re-arm and re-register the waker.
+            let next = self.last_activity + self.idle_timeout;
+            self.sleep.as_mut().reset(next);
+            let _ = self.sleep.as_mut().poll(cx);
         }
+        None
     }
 }
 
@@ -96,7 +94,7 @@ impl AsyncRead for IdleStream {
         let before = buf.filled().len();
         let res = Pin::new(&mut self.inner).poll_read(cx, buf);
         if buf.filled().len() > before {
-            self.reset_idle_timer();
+            self.note_activity();
         }
         res
     }
@@ -114,7 +112,7 @@ impl AsyncWrite for IdleStream {
         let res = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &res {
             if *n > 0 {
-                self.reset_idle_timer();
+                self.note_activity();
             }
         }
         res
@@ -145,7 +143,7 @@ impl AsyncWrite for IdleStream {
         let res = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
         if let Poll::Ready(Ok(n)) = &res {
             if *n > 0 {
-                self.reset_idle_timer();
+                self.note_activity();
             }
         }
         res
@@ -216,7 +214,6 @@ impl Peek for IdleStream {
     async fn try_peek(&mut self, buf: &mut [u8]) -> std::io::Result<bool> {
         // try_peek bypasses poll_read; race it against the idle timer so the
         // h2c-preface-stall / silent-client case is bounded too.
-        let idle_timeout = self.idle_timeout;
         let res = {
             let peek_fut = self.inner.try_peek(buf);
             tokio::pin!(peek_fut);
@@ -232,7 +229,7 @@ impl Peek for IdleStream {
             }
         };
         if matches!(res, Ok(true)) {
-            self.sleep.as_mut().reset(Instant::now() + idle_timeout);
+            self.note_activity();
         }
         res
     }
