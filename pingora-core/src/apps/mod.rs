@@ -224,12 +224,6 @@ where
             .as_ref()
             .map_or(false, |o| o.force_custom);
 
-        // h2c is for cleartext connections; on TLS, ALPN handles protocol negotiation.
-        // Otherwise, h2c stays true on TLS streams, forcing HTTP/1.1 clients into HTTP/2
-        if stream.get_ssl_digest().is_some() {
-            h2c = false;
-        }
-
         // Wrap the downstream stream with an idle-timeout adapter if configured.
         // This applies before H1/H2 protocol selection, so it uniformly bounds
         // H1 keep-alive idle, H2 between-streams idle, H2-preface stalls and
@@ -241,6 +235,12 @@ where
             .and_then(|o| o.downstream_idle_timeout)
         {
             stream = Box::new(IdleStream::new(stream, idle_timeout));
+        }
+
+        // h2c is for cleartext connections; on TLS, ALPN handles protocol negotiation.
+        // Otherwise, h2c stays true on TLS streams, forcing HTTP/1.1 clients into HTTP/2
+        if stream.get_ssl_digest().is_some() {
+            h2c = false;
         }
         // try to read h2 preface
         else if h2c && !custom {
