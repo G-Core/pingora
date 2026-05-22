@@ -18,6 +18,8 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use crate::listeners::TlsClientHello;
+
 /// The TLS connection information
 #[derive(Clone, Debug)]
 pub struct SslDigest {
@@ -31,8 +33,17 @@ pub struct SslDigest {
     pub serial_number: Option<String>,
     /// The digest of the peer's certificate
     pub cert_digest: Vec<u8>,
-    /// The user-defined TLS data
+    /// The user-defined TLS data captured in `handshake_complete_callback`.
+    ///
+    /// Type-erased because pingora cannot enumerate user types ahead of time;
+    /// retrieve with `extension.get::<YourType>()`.
     pub extension: SslDigestExtension,
+    /// The structured `ClientHello` captured by the TLS listener during the
+    /// `select_certificate_callback`.  Always set on a successful BoringSSL/
+    /// OpenSSL handshake when a `TlsAccept` callback object is installed; `None`
+    /// when the ClientHello body could not be parsed (malformed/truncated) or
+    /// when no callback object was registered.
+    pub client_hello: Option<TlsClientHello>,
 }
 
 impl SslDigest {
@@ -54,6 +65,7 @@ impl SslDigest {
             serial_number,
             cert_digest,
             extension: SslDigestExtension::default(),
+            client_hello: None,
         }
     }
 }

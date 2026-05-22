@@ -13,14 +13,18 @@
 // limitations under the License.
 
 use log::debug;
+use once_cell::sync::Lazy;
 use pingora_error::{ErrorType, OrErr, Result};
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 use crate::listeners::tls::boringssl_openssl::alpn::valid_alpn;
+use crate::listeners::TlsClientHello;
 pub use crate::protocols::tls::ALPN;
 use crate::protocols::IO;
+use crate::tls::ex_data::Index;
 use crate::tls::ssl::AlpnError;
-use crate::tls::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod, SslRef};
+use crate::tls::ssl::{NameType, Ssl, SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod, SslRef};
 use crate::{
     listeners::TlsAcceptCallbacks,
     protocols::tls::{
@@ -29,6 +33,55 @@ use crate::{
     },
 };
 pub const TLS_CONF_ERR: ErrorType = ErrorType::Custom("TLSConfigError");
+
+/// Typed ex_data slot for the captured ClientHello.  Using the typed `Index`
+/// lets `SslRef::ex_data` / `replace_ex_data` (from boring / openssl) handle
+/// the box, destructor, and clone-on-read mechanics safely — no raw FFI needed.
+static CLIENT_HELLO_DATA_INDEX: Lazy<Index<Ssl, TlsClientHello>> = Lazy::new(|| {
+    Ssl::new_ex_index::<TlsClientHello>()
+        .expect("failed to allocate client hello ex_data index")
+});
+
+pub(crate) fn client_hello_data(ssl: &SslRef) -> Option<TlsClientHello> {
+    ssl.ex_data(*CLIENT_HELLO_DATA_INDEX).cloned()
+}
+
+pub(crate) fn set_client_hello_data(ssl: &mut SslRef, hello: TlsClientHello) {
+    // `replace_ex_data` does the same first-write-wins / overwrite-in-place
+    // semantics the previous raw-FFI implementation hand-rolled: returns the
+    // old value (which we discard) if a previous capture existed, otherwise
+    // installs a new boxed copy.  The registered destructor is `boring`'s
+    // `free_data_box::<TlsClientHello>` which runs on SSL teardown.
+    let _ = ssl.replace_ex_data(*CLIENT_HELLO_DATA_INDEX, hello);
+}
+
+/// Extract the raw extensions block from a ClientHello body (no 2-byte length prefix).
+///
+/// Skips: legacy_version (2) + random (32) + session_id + cipher_suites +
+/// compression_methods, then returns the extensions payload without its length
+/// prefix. Returns `Some(Arc::from(&[]))` for a valid ClientHello with no
+/// extensions, and `None` for malformed/truncated input — callers treat `None`
+/// as "JA4 unavailable" rather than "no extensions".
+fn extract_extensions_bytes(body: &[u8]) -> Option<Arc<[u8]>> {
+    // Skip legacy_version (2) + random (32)
+    let after_fixed = body.get(34..)?;
+    // Skip session_id (1-byte length + payload)
+    let session_id_len = *after_fixed.first()? as usize;
+    let after_session = after_fixed.get(1 + session_id_len..)?;
+    // Skip cipher_suites (2-byte length + payload)
+    let cipher_len =
+        u16::from_be_bytes([*after_session.first()?, *after_session.get(1)?]) as usize;
+    let after_ciphers = after_session.get(2 + cipher_len..)?;
+    // Skip compression_methods (1-byte length + payload)
+    let comp_len = *after_ciphers.first()? as usize;
+    let after_comp = after_ciphers.get(1 + comp_len..)?;
+    if after_comp.is_empty() {
+        return Some(Arc::from(&[] as &[u8]));
+    }
+    // Read extensions length and return the payload (no length prefix).
+    let ext_len = u16::from_be_bytes([*after_comp.first()?, *after_comp.get(1)?]) as usize;
+    after_comp.get(2..2 + ext_len).map(Arc::from)
+}
 
 pub(crate) struct Acceptor {
     ssl_acceptor: SslAcceptor,
@@ -94,10 +147,34 @@ impl TlsSettings {
             TLS_CONF_ERR,
             "fail to create mozilla_intermediate_v5 Acceptor",
         )?;
-        Ok(TlsSettings {
+        let mut settings = TlsSettings {
             accept_builder,
             callbacks: Some(callbacks),
-        })
+        };
+        settings
+            .accept_builder
+            .set_select_certificate_callback(|mut ch| {
+                let body = ch.as_bytes();
+                // The first 2 bytes of the ClientHello body are the legacy_version.
+                let legacy_version = if body.len() >= 2 {
+                    u16::from_be_bytes([body[0], body[1]])
+                } else {
+                    0
+                };
+                // None means malformed/truncated body — skip capture so JA4
+                // is absent rather than incorrect (empty extension list).
+                if let Some(extensions) = extract_extensions_bytes(body) {
+                    let hello = TlsClientHello {
+                        legacy_version,
+                        cipher_suites: Arc::from(ch.ciphers()),
+                        sni: ch.servername(NameType::HOST_NAME).map(|s| s.to_string()),
+                        extensions,
+                    };
+                    set_client_hello_data(ch.ssl_mut(), hello);
+                }
+                Ok(())
+            });
+        Ok(settings)
     }
 
     /// Enable HTTP/2 support for this endpoint, which is default off.

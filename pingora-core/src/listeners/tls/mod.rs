@@ -18,6 +18,9 @@ mod boringssl_openssl;
 #[cfg(feature = "openssl_derived")]
 pub use boringssl_openssl::*;
 
+#[cfg(feature = "openssl_derived")]
+pub(crate) use boringssl_openssl::client_hello_data;
+
 #[cfg(feature = "rustls")]
 mod rustls;
 

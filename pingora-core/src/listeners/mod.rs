@@ -122,6 +122,25 @@ pub trait TlsAccept {
 
 pub type TlsAcceptCallbacks = Box<dyn TlsAccept + Send + Sync>;
 
+/// Downstream TLS ClientHello data exposed by the listener stack.
+///
+/// Fields are pre-extracted from BoringSSL's `ClientHello` struct during the
+/// `select_certificate_callback`, so callers do not need to parse raw bytes.
+/// Wire-order bytes (big-endian per RFC 8446 §4.1.2); `cipher_suites` and
+/// `extensions` exclude their respective 2-byte length prefixes.
+///
+/// `cipher_suites` and `extensions` are `Arc<[u8]>` so cloning the struct across
+/// keep-alive requests on the same connection is a refcount bump rather than a
+/// memcpy — the extension block (100-500 bytes typically) is the dominant cost
+/// otherwise.
+#[derive(Clone, Debug)]
+pub struct TlsClientHello {
+    pub legacy_version: u16,
+    pub cipher_suites: Arc<[u8]>,
+    pub sni: Option<String>,
+    pub extensions: Arc<[u8]>,
+}
+
 struct TransportStackBuilder {
     l4: ServerAddress,
     tls: Option<TlsSettings>,
