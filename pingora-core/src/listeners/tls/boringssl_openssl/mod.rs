@@ -24,7 +24,9 @@ pub use crate::protocols::tls::ALPN;
 use crate::protocols::IO;
 use crate::tls::ex_data::Index;
 use crate::tls::ssl::AlpnError;
-use crate::tls::ssl::{NameType, Ssl, SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod, SslRef};
+use crate::tls::ssl::{
+    NameType, Ssl, SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod, SslRef,
+};
 use crate::{
     listeners::TlsAcceptCallbacks,
     protocols::tls::{
@@ -38,8 +40,7 @@ pub const TLS_CONF_ERR: ErrorType = ErrorType::Custom("TLSConfigError");
 /// lets `SslRef::ex_data` / `replace_ex_data` (from boring / openssl) handle
 /// the box, destructor, and clone-on-read mechanics safely — no raw FFI needed.
 static CLIENT_HELLO_DATA_INDEX: Lazy<Index<Ssl, TlsClientHello>> = Lazy::new(|| {
-    Ssl::new_ex_index::<TlsClientHello>()
-        .expect("failed to allocate client hello ex_data index")
+    Ssl::new_ex_index::<TlsClientHello>().expect("failed to allocate client hello ex_data index")
 });
 
 pub(crate) fn client_hello_data(ssl: &SslRef) -> Option<TlsClientHello> {
@@ -69,8 +70,7 @@ fn extract_extensions_bytes(body: &[u8]) -> Option<Arc<[u8]>> {
     let session_id_len = *after_fixed.first()? as usize;
     let after_session = after_fixed.get(1 + session_id_len..)?;
     // Skip cipher_suites (2-byte length + payload)
-    let cipher_len =
-        u16::from_be_bytes([*after_session.first()?, *after_session.get(1)?]) as usize;
+    let cipher_len = u16::from_be_bytes([*after_session.first()?, *after_session.get(1)?]) as usize;
     let after_ciphers = after_session.get(2 + cipher_len..)?;
     // Skip compression_methods (1-byte length + payload)
     let comp_len = *after_ciphers.first()? as usize;

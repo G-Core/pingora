@@ -14,6 +14,7 @@
 
 //! TLS server specific implementation
 
+use crate::listeners::tls::client_hello_data;
 use crate::listeners::TlsAcceptCallbacks;
 use crate::protocols::tls::SslStream;
 use crate::protocols::{Shutdown, IO};
@@ -21,7 +22,6 @@ use crate::tls::ext;
 use crate::tls::ext::ssl_from_acceptor;
 use crate::tls::ssl;
 use crate::tls::ssl::SslAcceptor;
-use crate::listeners::tls::client_hello_data;
 
 use async_trait::async_trait;
 use log::warn;
