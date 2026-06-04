@@ -229,6 +229,7 @@ impl TransportStackBuilder {
             l4,
             tls: self.build_tls(),
             l4_buffer: self.l4_buffer,
+            pre_tls_callback: self.pre_tls_callback.clone(),
         })
     }
 

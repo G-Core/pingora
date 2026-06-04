@@ -446,7 +446,7 @@ where
 
     // Connect with the same retry logic as send_fds_to.
     let conn_result: Result<(), Error> = loop {
-        match socket::connect(send_fd, &unix_addr) {
+        match socket::connect(send_fd.as_raw_fd(), &unix_addr) {
             Ok(_) => break Ok(()),
             Err(e) => match e {
                 Errno::ENOENT | Errno::ECONNREFUSED | Errno::EACCES => {
@@ -495,7 +495,7 @@ where
                 let mut nb_polls = nonblocking_polls;
                 let sent = loop {
                     match socket::sendmsg(
-                        send_fd,
+                        send_fd.as_raw_fd(),
                         &io_vec,
                         &cmsg,
                         socket::MsgFlags::empty(),
@@ -574,17 +574,24 @@ where
         Ok(()) => debug!("unlink {} done", path),
         Err(e) => debug!("unlink {} failed: {}", path, e),
     }
-    socket::bind(listen_fd, &unix_addr).unwrap();
+    socket::bind(listen_fd.as_raw_fd(), &unix_addr).unwrap();
     stat::fchmodat(
-        None,
+        // SAFETY: AT_FDCWD is a well-defined POSIX sentinel constant used by *at() syscalls
+        // to indicate the current working directory. It is not a real file descriptor and does
+        // not require ownership or lifetime guarantees.
+        unsafe { BorrowedFd::borrow_raw(libc::AT_FDCWD) },
         path,
         stat::Mode::all(),
         stat::FchmodatFlags::FollowSymlink,
     )
     .unwrap();
-    socket::listen(listen_fd, 8).unwrap();
+    socket::listen(
+        &listen_fd,
+        Backlog::new(8).expect("8 is well within SOMAXCONN"),
+    )
+    .unwrap();
 
-    let conn_fd = match accept_with_retry_timeout(listen_fd, max_retry) {
+    let conn_fd = match accept_with_retry_timeout(listen_fd.as_raw_fd(), max_retry) {
         Ok(fd) => fd,
         Err(e) => {
             error!("Giving up reading socket from: {path}, error: {e:?}");
@@ -612,15 +619,18 @@ where
         )
         .unwrap();
 
-        if msg.bytes == 0 {
+        let msg_bytes = msg.bytes;
+        let msg_cmsgs: Vec<socket::ControlMessageOwned> = msg.cmsgs()?.collect();
+
+        if msg_bytes == 0 {
             // EOF: sender closed the connection.
             break;
         }
 
-        match deserialize_vec_string(&payload_buf[..msg.bytes]) {
+        match deserialize_vec_string(&payload_buf[..msg_bytes]) {
             Ok(keys) => {
                 all_keys.extend(keys);
-                for cmsg in msg.cmsgs() {
+                for cmsg in msg_cmsgs {
                     if let socket::ControlMessageOwned::ScmRights(mut chunk_fds) = cmsg {
                         all_fds.append(&mut chunk_fds);
                     } else {
@@ -632,7 +642,7 @@ where
                 // Deserialization failed: skip this chunk entirely so keys and FDs stay
                 // in sync. Drain and close any kernel-duped FDs to avoid leaking them.
                 warn!("Failed to deserialize keys in chunk — skipping chunk FDs: {e:?}");
-                for cmsg in msg.cmsgs() {
+                for cmsg in msg_cmsgs {
                     if let socket::ControlMessageOwned::ScmRights(chunk_fds) = cmsg {
                         for fd in chunk_fds {
                             let _ = nix::unistd::close(fd);
