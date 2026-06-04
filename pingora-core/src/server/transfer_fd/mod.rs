@@ -873,7 +873,7 @@ mod tests {
         let (read_end, write_end) = nix::unistd::pipe().expect("pipe()");
         // Close the read end immediately; we only need a single real fd for tests.
         let _ = nix::unistd::close(read_end);
-        write_end
+        write_end.as_raw_fd()
     }
 
     #[test]
