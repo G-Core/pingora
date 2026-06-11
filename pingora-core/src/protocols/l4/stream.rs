@@ -19,6 +19,7 @@ use futures::FutureExt;
 use log::{debug, error};
 
 use pingora_error::{ErrorType::*, OrErr, Result};
+use std::cell::RefCell;
 #[cfg(target_os = "linux")]
 use std::io::IoSliceMut;
 #[cfg(unix)]
@@ -156,6 +157,109 @@ impl AsRawSocket for RawStream {
     }
 }
 
+/// Maximum number of recycled L4 read buffers kept per worker thread.
+const READ_BUF_POOL_MAX_PER_THREAD: usize = 8;
+
+thread_local! {
+    /// Per-thread free list of L4 read buffers.
+    ///
+    /// With `work_stealing: false` a connection lives and dies on its accepting
+    /// thread, so buffers always recycle locally with zero synchronization. With
+    /// work stealing enabled this stays correct: a buffer is returned to the
+    /// pool of whichever thread drops the connection, and every thread also
+    /// accepts (consuming buffers), so pools stay balanced.
+    static READ_BUF_POOL: RefCell<Vec<Box<[u8]>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A per-connection L4 read buffer recycled through [`READ_BUF_POOL`].
+///
+/// Allocating this buffer fresh per accepted connection (as tokio's
+/// `BufReader::with_capacity` does, via `alloc_zeroed`) makes jemalloc recycle
+/// a large extent and "zero" it with madvise(MADV_DONTNEED) on every accept —
+/// at >100k conn/s that broadcasts TLB-shootdown IPIs to every core running a
+/// worker thread and dominates the connection-setup cost (EPX-138 perf
+/// analysis, 2026-06-11). Pooling keeps the hot path away from the allocator
+/// entirely; the buffer's previous content is never exposed because only the
+/// `pos..filled` region written by the latest read is ever handed out.
+struct PooledReadBuf {
+    /// `None` only transiently during drop.
+    storage: Option<Box<[u8]>>,
+    /// Start of the unconsumed region.
+    pos: usize,
+    /// End of the valid (filled) region.
+    filled: usize,
+}
+
+impl PooledReadBuf {
+    /// Take a buffer of exactly `size` bytes from the thread-local pool, or
+    /// allocate one if none is available.
+    fn take(size: usize) -> Self {
+        let storage = READ_BUF_POOL
+            .with(|pool| {
+                let mut pool = pool.borrow_mut();
+                pool.iter()
+                    .position(|b| b.len() == size)
+                    .map(|i| pool.swap_remove(i))
+            })
+            .unwrap_or_else(|| vec![0u8; size].into_boxed_slice());
+        PooledReadBuf {
+            storage: Some(storage),
+            pos: 0,
+            filled: 0,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.storage.as_ref().map_or(0, |s| s.len())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pos == self.filled
+    }
+
+    fn storage_mut(&mut self) -> &mut [u8] {
+        self.storage.as_mut().expect("storage present until drop")
+    }
+
+    /// Mark the first `n` bytes of storage as freshly filled.
+    fn set_filled(&mut self, n: usize) {
+        self.pos = 0;
+        self.filled = n;
+    }
+
+    /// Consume up to `n` unconsumed bytes, returning the consumed slice.
+    fn consume(&mut self, n: usize) -> &[u8] {
+        let n = n.min(self.filled - self.pos);
+        let start = self.pos;
+        self.pos += n;
+        &self.storage.as_ref().expect("storage present until drop")[start..start + n]
+    }
+}
+
+impl Drop for PooledReadBuf {
+    fn drop(&mut self) {
+        if let Some(storage) = self.storage.take() {
+            // try_with: TLS may already be torn down during thread exit.
+            let _ = READ_BUF_POOL.try_with(|pool| {
+                let mut pool = pool.borrow_mut();
+                if pool.len() < READ_BUF_POOL_MAX_PER_THREAD {
+                    pool.push(storage);
+                }
+            });
+        }
+    }
+}
+
+impl std::fmt::Debug for PooledReadBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PooledReadBuf")
+            .field("capacity", &self.capacity())
+            .field("pos", &self.pos)
+            .field("filled", &self.filled)
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 struct RawStreamWrapper {
     pub(crate) stream: RawStream,
@@ -169,6 +273,8 @@ struct RawStreamWrapper {
     /// come from old sockets created by older version of pingora and so,
     /// this vector can only grow.
     reusable_cmsg_space: Vec<u8>,
+    /// Pooled read buffer; `None` means unbuffered reads (pass-through).
+    read_buf: Option<PooledReadBuf>,
 }
 
 impl RawStreamWrapper {
@@ -180,6 +286,7 @@ impl RawStreamWrapper {
             enable_rx_ts: false,
             #[cfg(target_os = "linux")]
             reusable_cmsg_space: nix::cmsg_space!(nix::sys::socket::Timestamps),
+            read_buf: None,
         }
     }
 
@@ -187,19 +294,28 @@ impl RawStreamWrapper {
     pub fn enable_rx_ts(&mut self, enable_rx_ts: bool) {
         self.enable_rx_ts = enable_rx_ts;
     }
+
+    /// Enable (size > 0) or disable (size == 0) pooled read buffering.
+    pub fn set_pooled_read_buffer(&mut self, size: usize) {
+        self.read_buf = if size > 0 {
+            Some(PooledReadBuf::take(size))
+        } else {
+            None
+        };
+    }
 }
 
-impl AsyncRead for RawStreamWrapper {
+impl RawStreamWrapper {
+    /// Read directly from the underlying stream, bypassing the pooled buffer.
     #[cfg(not(target_os = "linux"))]
-    fn poll_read(
-        self: Pin<&mut Self>,
+    fn poll_read_raw(
+        &mut self,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         // Safety: Basic enum pin projection
         unsafe {
-            let rs_wrapper = Pin::get_unchecked_mut(self);
-            match &mut rs_wrapper.stream {
+            match &mut self.stream {
                 RawStream::Tcp(s) => Pin::new_unchecked(s).poll_read(cx, buf),
                 #[cfg(unix)]
                 RawStream::Unix(s) => Pin::new_unchecked(s).poll_read(cx, buf),
@@ -208,9 +324,10 @@ impl AsyncRead for RawStreamWrapper {
         }
     }
 
+    /// Read directly from the underlying stream, bypassing the pooled buffer.
     #[cfg(target_os = "linux")]
-    fn poll_read(
-        self: Pin<&mut Self>,
+    fn poll_read_raw(
+        &mut self,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
@@ -221,8 +338,7 @@ impl AsyncRead for RawStreamWrapper {
         if !self.enable_rx_ts {
             // Safety: Basic enum pin projection
             unsafe {
-                let rs_wrapper = Pin::get_unchecked_mut(self);
-                match &mut rs_wrapper.stream {
+                match &mut self.stream {
                     RawStream::Tcp(s) => return Pin::new_unchecked(s).poll_read(cx, buf),
                     RawStream::Unix(s) => return Pin::new_unchecked(s).poll_read(cx, buf),
                     RawStream::Virtual(s) => return Pin::new_unchecked(s).poll_read(cx, buf),
@@ -230,9 +346,7 @@ impl AsyncRead for RawStreamWrapper {
             }
         }
 
-        // Safety: Basic pin projection to get mutable stream
-        let rs_wrapper = unsafe { Pin::get_unchecked_mut(self) };
-        match &mut rs_wrapper.stream {
+        match &mut self.stream {
             RawStream::Tcp(s) => {
                 loop {
                     ready!(s.poll_read_ready(cx))?;
@@ -243,13 +357,13 @@ impl AsyncRead for RawStreamWrapper {
                     };
                     let mut iov = [IoSliceMut::new(b)];
 
-                    rs_wrapper.reusable_cmsg_space.fill(0);
+                    self.reusable_cmsg_space.fill(0);
 
                     match s.try_io(Interest::READABLE, || {
                         recvmsg::<SockaddrStorage>(
                             s.as_raw_fd(),
                             &mut iov,
-                            Some(&mut rs_wrapper.reusable_cmsg_space),
+                            Some(&mut self.reusable_cmsg_space),
                             MsgFlags::empty(),
                         )
                         .map_err(|errno| errno.into())
@@ -261,7 +375,7 @@ impl AsyncRead for RawStreamWrapper {
                             {
                                 // The returned timestamp is a real (i.e. not monotonic) timestamp
                                 // https://docs.kernel.org/networking/timestamping.html
-                                rs_wrapper.rx_ts =
+                                self.rx_ts =
                                     SystemTime::UNIX_EPOCH.checked_add(rtime.system.into());
                             }
                             // Safety: We trust `recvmsg` to have filled up `r.bytes` bytes in the buffer.
@@ -280,6 +394,51 @@ impl AsyncRead for RawStreamWrapper {
             RawStream::Unix(s) => unsafe { Pin::new_unchecked(s).poll_read(cx, buf) },
             RawStream::Virtual(s) => unsafe { Pin::new_unchecked(s).poll_read(cx, buf) },
         }
+    }
+}
+
+impl AsyncRead for RawStreamWrapper {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // Safety: Basic pin projection; the underlying stream is never moved.
+        let this = unsafe { Pin::get_unchecked_mut(self) };
+
+        // Unbuffered (e.g. upstream connections): straight to the stream.
+        let Some(mut pooled) = this.read_buf.take() else {
+            return this.poll_read_raw(cx, buf);
+        };
+
+        if pooled.is_empty() {
+            // Large destination: bypass the pooled buffer and read directly
+            // into `buf` (mirrors tokio BufReader's bypass heuristic).
+            if buf.remaining() >= pooled.capacity() {
+                let result = this.poll_read_raw(cx, buf);
+                this.read_buf = Some(pooled);
+                return result;
+            }
+            // Refill the pooled buffer with one large read.
+            let mut refill = ReadBuf::new(pooled.storage_mut());
+            match this.poll_read_raw(cx, &mut refill) {
+                Poll::Ready(Ok(())) => {
+                    let n = refill.filled().len();
+                    pooled.set_filled(n);
+                    // n == 0 is EOF: fall through and copy nothing.
+                }
+                other => {
+                    // Pending or Err: nothing was filled.
+                    this.read_buf = Some(pooled);
+                    return other;
+                }
+            }
+        }
+
+        let chunk = pooled.consume(buf.remaining());
+        buf.put_slice(chunk);
+        this.read_buf = Some(pooled);
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -513,19 +672,24 @@ impl Stream {
         }
     }
 
-    /// Set the buffer of BufStream
+    /// Set the read/write buffering of the stream.
     /// It is only set later because of the malloc overhead in critical accept() path
+    ///
+    /// The read side is buffered by a pooled buffer inside [`RawStreamWrapper`]
+    /// rather than by `BufStream`: tokio's `BufReader` allocates a fresh zeroed
+    /// buffer per connection (`alloc_zeroed`), which at high accept rates turns
+    /// into jemalloc large-extent churn and madvise-driven TLB shootdowns. The
+    /// `BufStream` read capacity is set to 0, which makes its read path a pure
+    /// pass-through to the wrapper.
     pub(crate) fn set_buffer(&mut self, buffer: L4BufferSettings) {
         use std::mem;
         // Since BufStream doesn't provide an API to adjust the buf directly,
         // we take the raw stream out of it and put it in a new BufStream with the size we want
         let stream = mem::take(&mut self.stream);
         let stream = stream.map(|s| {
-            BufStream::with_capacity(
-                buffer.read_capacity(),
-                buffer.write_capacity(),
-                s.into_inner(),
-            )
+            let mut raw = s.into_inner();
+            raw.set_pooled_read_buffer(buffer.read_capacity());
+            BufStream::with_capacity(0, buffer.write_capacity(), raw)
         });
         let _ = mem::replace(&mut self.stream, stream);
     }
@@ -913,6 +1077,85 @@ mod tests {
         let n = stream.read(buffer.as_mut_slice()).await.unwrap();
         assert_eq!(n, message.len());
         assert!(stream.rx_ts.is_none());
+    }
+
+    /// Drain the thread-local read-buffer pool (test isolation).
+    fn drain_read_buf_pool() {
+        READ_BUF_POOL.with(|p| p.borrow_mut().clear());
+    }
+
+    fn read_buf_pool_len() -> usize {
+        READ_BUF_POOL.with(|p| p.borrow().len())
+    }
+
+    #[tokio::test]
+    async fn test_pooled_read_buffer_correctness() {
+        drain_read_buf_pool();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 3000 bytes of patterned data, sent in two chunks
+        let payload: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        let payload2 = payload.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(&payload2[..1000]).await.unwrap();
+            stream.flush().await.unwrap();
+            stream.write_all(&payload2[1000..]).await.unwrap();
+        });
+
+        let mut stream: Stream = TcpStream::connect(addr).await.unwrap().into();
+        // Buffer (1024) larger than the read chunks (64) => pooled path with
+        // refills; also exercises buffered data spanning multiple reads.
+        stream.set_buffer(L4BufferSettings::new(1024, 64));
+
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 64];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(received, payload);
+
+        // Dropping the stream must recycle its buffer into the pool.
+        assert_eq!(read_buf_pool_len(), 0);
+        drop(stream);
+        assert_eq!(read_buf_pool_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_pooled_read_buffer_reuse_and_bypass() {
+        drain_read_buf_pool();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let message = b"large destination bypass";
+
+        let msg2 = *message;
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(&msg2).await.unwrap();
+        });
+
+        // Pre-seed the pool, then verify take() reuses instead of allocating.
+        let seeded = PooledReadBuf::take(512);
+        drop(seeded);
+        assert_eq!(read_buf_pool_len(), 1);
+
+        let mut stream: Stream = TcpStream::connect(addr).await.unwrap().into();
+        stream.set_buffer(L4BufferSettings::new(512, 64));
+        // take() must have consumed the pooled entry
+        assert_eq!(read_buf_pool_len(), 0);
+
+        // Destination (1024) >= pooled capacity (512) => bypass path
+        let mut buffer = vec![0u8; 1024];
+        let n = stream.read(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..n], &message[..n]);
+
+        drop(stream);
+        assert_eq!(read_buf_pool_len(), 1);
     }
 
     #[tokio::test]
