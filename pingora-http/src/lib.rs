@@ -846,9 +846,12 @@ fn case_header_iter<'a>(
     // key's case name(s) via `get_all` instead relies only on per-key insertion order, which is
     // unaffected by table-wide rehashing.
     name_map.into_iter().flat_map(move |name_map| {
-        value_map
-            .keys()
-            .flat_map(move |key| name_map.get_all(key).into_iter().zip(value_map.get_all(key)))
+        value_map.keys().flat_map(move |key| {
+            name_map
+                .get_all(key)
+                .into_iter()
+                .zip(value_map.get_all(key))
+        })
     })
 }
 
