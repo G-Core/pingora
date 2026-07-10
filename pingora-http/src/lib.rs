@@ -50,13 +50,9 @@ pub mod prelude {
 HMap({
     "foo": ["Foo", "foO", "FoO"]
 })
-This map is kept as a mirror of the map of header values: every mutation is applied
-to both maps identically. Note that the two maps' *overall* iteration order can
-still diverge (each `HMap` may independently rehash under its internal hash-flooding
-defense, picking its own random seed), so callers must never zip the two maps'
-`.iter()`s together. Instead, look up each key's case name(s) via `get_all(key)`,
-which stays correct regardless of either map's internal bucket layout because it
-only relies on per-key insertion order, not table-wide order.
+The order how HeaderMap iter over its items is "arbitrary, but consistent".
+Hopefully this property makes sure this map of header names always iterates in the
+same order of the map of header values.
 This idea is inspaired by hyper @nox
 */
 type CaseMap = HMap<CaseHeaderName>;
@@ -223,8 +219,13 @@ impl RequestHeader {
         let key_map = self.header_name_map.as_ref();
         let value_map = &self.base.headers;
 
-        if key_map.is_some() {
-            for (case_header, val) in case_header_iter(key_map, value_map) {
+        if let Some(key_map) = key_map {
+            let iter = key_map.iter().zip(value_map.iter());
+            for ((header, case_header), (header2, val)) in iter {
+                if header != header2 {
+                    // in case the header iteration order changes in future versions of HMap
+                    panic!("header iter mismatch {}, {}", header, header2)
+                }
                 f(HeaderNameVariant::Case(case_header), val)?;
             }
         } else {
@@ -542,8 +543,13 @@ impl ResponseHeader {
         let key_map = self.header_name_map.as_ref();
         let value_map = &self.base.headers;
 
-        if key_map.is_some() {
-            for (case_header, val) in case_header_iter(key_map, value_map) {
+        if let Some(key_map) = key_map {
+            let iter = key_map.iter().zip(value_map.iter());
+            for ((header, case_header), (header2, val)) in iter {
+                if header != header2 {
+                    // in case the header iteration order changes in future versions of HMap
+                    panic!("header iter mismatch {}, {}", header, header2)
+                }
                 f(HeaderNameVariant::Case(case_header), val)?;
             }
         } else {
@@ -837,21 +843,15 @@ fn case_header_iter<'a>(
     name_map: Option<&'a CaseMap>,
     value_map: &'a HMap,
 ) -> impl Iterator<Item = (&'a CaseHeaderName, &'a HeaderValue)> + 'a {
-    // `name_map` and `value_map` receive identical insert/append/remove operations, so they
-    // always hold the same set of keys, each with the same number of values in the same
-    // insertion order. But the two `HMap`s are independent instances, and `HMap`'s internal
-    // hash-flooding defense can reseed and rehash each one on its own, so their *overall*
-    // iteration order can diverge even though their content is identical. Zipping the two
-    // `.iter()`s together (as this used to do) breaks under that divergence. Looking up each
-    // key's case name(s) via `get_all` instead relies only on per-key insertion order, which is
-    // unaffected by table-wide rehashing.
-    name_map.into_iter().flat_map(move |name_map| {
-        value_map.keys().flat_map(move |key| {
-            name_map
-                .get_all(key)
-                .into_iter()
-                .zip(value_map.get_all(key))
-        })
+    name_map.into_iter().flat_map(|name_map| {
+        name_map
+            .iter()
+            .zip(value_map.iter())
+            .map(|((h1, name), (h2, value))| {
+                // in case the header iteration order changes in future versions of HMap
+                assert_eq!(h1, h2, "header iter mismatch {}, {}", h1, h2);
+                (name, value)
+            })
     })
 }
 
@@ -926,47 +926,6 @@ mod tests {
         resp.case_header_iter().for_each(|(_, _)| {
             unreachable!("response has no case");
         });
-    }
-
-    /// Regression test for a real production panic: `header_name_map` and `base.headers`
-    /// are two independent `HMap`s that normally receive identical operations in lockstep,
-    /// but `HMap`'s internal hash-flooding defense can rehash each one independently (picking
-    /// its own random seed), diverging their *overall* iteration order without changing their
-    /// content. `case_header_iter` used to zip the two maps' `.iter()`s together and assert
-    /// they lined up, which broke under that divergence. Simulate the divergence directly by
-    /// building the two maps with the same header -> value(s) content but different top-level
-    /// insertion order, and confirm `case_header_iter` still pairs everything correctly.
-    #[test]
-    fn case_header_iter_survives_map_reordering() {
-        let mut value_map: HMap = HMap::new();
-        value_map.append(HeaderName::from_static("a"), HeaderValue::from_static("1"));
-        value_map.append(HeaderName::from_static("b"), HeaderValue::from_static("2"));
-        value_map.append(HeaderName::from_static("b"), HeaderValue::from_static("3"));
-
-        let mut name_map: CaseMap = CaseMap::default();
-        // Insert "b" before "a", unlike `value_map` above, to give the two maps different
-        // top-level bucket orders while keeping the same per-key content.
-        name_map.append(HeaderName::from_static("b"), "B".into_case_header_name());
-        name_map.append(HeaderName::from_static("b"), "bB".into_case_header_name());
-        name_map.append(HeaderName::from_static("a"), "A".into_case_header_name());
-
-        let pairs: Vec<(String, String)> = case_header_iter(Some(&name_map), &value_map)
-            .map(|(k, v)| {
-                (
-                    String::from_utf8_lossy(k.as_slice()).into_owned(),
-                    String::from_utf8_lossy(v.as_ref()).into_owned(),
-                )
-            })
-            .collect();
-
-        assert_eq!(
-            pairs,
-            vec![
-                ("A".to_string(), "1".to_string()),
-                ("B".to_string(), "2".to_string()),
-                ("bB".to_string(), "3".to_string()),
-            ]
-        );
     }
 
     #[test]
