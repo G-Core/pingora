@@ -682,7 +682,7 @@ mod test {
         let key = CacheKey::new("identified", "1").to_compact();
         let hash = key.combined_bin();
         cache.cached.write().insert(
-            hash.clone(),
+            hash,
             CacheObject {
                 meta: (Vec::new(), Vec::new()),
                 body: Bytes::new(),
