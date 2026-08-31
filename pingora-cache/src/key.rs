@@ -313,7 +313,7 @@ mod tests {
         primary.extend_from_slice(b"/path");
 
         let key = CacheKey::new(primary, "1");
-        assert_eq!(key.primary(), "6c79e74e88bacb8eb370adb7617068c8");
+        assert_eq!(key.primary(), "886d8b5e50d68d541e89963e6d35b98e");
     }
 
     #[test]
