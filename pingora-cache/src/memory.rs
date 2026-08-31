@@ -615,7 +615,7 @@ mod test {
         static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
         let cache = &MEM_CACHE;
 
-        let key = CacheKey::new("", "a", "1").to_compact();
+        let key = CacheKey::new("", "a").to_compact();
         let hash = key.combined_bin();
         let meta = (
             "meta_key".as_bytes().to_vec(),
@@ -647,7 +647,7 @@ mod test {
         static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
         let cache = &MEM_CACHE;
 
-        let key = CacheKey::new("", "a", "1").to_compact();
+        let key = CacheKey::new("", "a").to_compact();
         let hash = key.combined_bin();
         let meta = (
             "meta_key".as_bytes().to_vec(),
@@ -680,12 +680,12 @@ mod test {
         static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
         let cache = &MEM_CACHE;
         let key = CacheKey::new("identified", "1").to_compact();
-        let hash = key.combined();
+        let hash = key.combined_bin();
         cache.cached.write().insert(
             hash.clone(),
             CacheObject {
                 meta: (Vec::new(), Vec::new()),
-                body: Arc::new(Vec::new()),
+                body: Bytes::new(),
             },
         );
         let entry =
@@ -706,12 +706,12 @@ mod test {
         static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
         let cache = &MEM_CACHE;
         let key = CacheKey::new("key-only", "1").to_compact();
-        let hash = key.combined();
+        let hash = key.combined_bin();
         cache.cached.write().insert(
             hash,
             CacheObject {
                 meta: (Vec::new(), Vec::new()),
-                body: Arc::new(Vec::new()),
+                body: Bytes::new(),
             },
         );
 
