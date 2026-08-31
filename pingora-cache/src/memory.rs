@@ -19,8 +19,11 @@
 //TODO: Mark this module #[test] only
 
 use super::*;
-use crate::key::{CompactCacheKey, HashBinary};
-use crate::storage::{streaming_write::U64WriteId, HandleHit, HandleMiss};
+use crate::eviction::CacheEntryKey;
+use crate::key::HashBinary;
+use crate::storage::{
+    streaming_write::U64WriteId, HandleHit, HandleMiss, PurgeOutcome, PurgeTarget,
+};
 use crate::trace::SpanHandle;
 
 use async_trait::async_trait;
@@ -393,16 +396,25 @@ impl Storage for MemCache {
 
     async fn purge(
         &'static self,
-        key: &CompactCacheKey,
+        target: PurgeTarget<'_>,
         _type: PurgeType,
         _trace: &SpanHandle,
-    ) -> Result<bool> {
+    ) -> Result<PurgeOutcome> {
+        // This test store does not retain entry IDs, so it cannot safely match identified entries.
+        if matches!(target, PurgeTarget::Exact(CacheEntryKey::Identified { .. })) {
+            return Ok(PurgeOutcome::NotFound);
+        }
         // This usually purges the primary key because, without a lookup, the variance key is usually
         // empty
-        let hash = key.combined_bin();
+        let hash = target.key().combined_bin();
         let temp_removed = self.temp.write().remove(&hash).is_some();
         let cache_removed = self.cached.write().remove(&hash).is_some();
-        Ok(temp_removed || cache_removed)
+        if temp_removed || cache_removed {
+            // MemCache does not assign entry IDs, so active purges select key-only entries.
+            Ok(PurgeOutcome::Purged(None))
+        } else {
+            Ok(PurgeOutcome::NotFound)
+        }
     }
 
     async fn update_meta(
@@ -454,7 +466,7 @@ mod test {
         static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
         let span = &Span::inactive().handle();
 
-        let key1 = CacheKey::new("", "a", "1");
+        let key1 = CacheKey::new("a", "1");
         let res = MEM_CACHE.lookup(&key1, span).await.unwrap();
         assert!(res.is_none());
 
@@ -491,7 +503,7 @@ mod test {
         static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
         let span = &Span::inactive().handle();
 
-        let key1 = CacheKey::new("", "a", "1");
+        let key1 = CacheKey::new("a", "1");
         let res = MEM_CACHE.lookup(&key1, span).await.unwrap();
         assert!(res.is_none());
 
@@ -536,7 +548,7 @@ mod test {
         static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
         let span = &Span::inactive().handle();
 
-        let key1 = CacheKey::new("", "a", "1");
+        let key1 = CacheKey::new("a", "1");
         let res = MEM_CACHE.lookup(&key1, span).await.unwrap();
         assert!(res.is_none());
 
@@ -619,7 +631,11 @@ mod test {
         assert!(cache.temp.read().contains_key(&hash));
 
         let result = cache
-            .purge(&key, PurgeType::Invalidation, &Span::inactive().handle())
+            .purge(
+                crate::storage::PurgeTarget::Active(&key),
+                PurgeType::Invalidation,
+                &Span::inactive().handle(),
+            )
             .await;
         assert!(result.is_ok());
 
@@ -648,10 +664,68 @@ mod test {
         assert!(cache.cached.read().contains_key(&hash));
 
         let result = cache
-            .purge(&key, PurgeType::Invalidation, &Span::inactive().handle())
+            .purge(
+                crate::storage::PurgeTarget::Active(&key),
+                PurgeType::Invalidation,
+                &Span::inactive().handle(),
+            )
             .await;
         assert!(result.is_ok());
 
         assert!(!cache.cached.read().contains_key(&hash));
+    }
+
+    #[tokio::test]
+    async fn test_exact_identified_purge_does_not_remove_key_only_entry() {
+        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        let cache = &MEM_CACHE;
+        let key = CacheKey::new("identified", "1").to_compact();
+        let hash = key.combined();
+        cache.cached.write().insert(
+            hash.clone(),
+            CacheObject {
+                meta: (Vec::new(), Vec::new()),
+                body: Arc::new(Vec::new()),
+            },
+        );
+        let entry =
+            crate::eviction::CacheEntryKey::identified(key, crate::eviction::CacheEntryId::new(1));
+        let target = crate::storage::PurgeTarget::Exact(&entry);
+
+        let outcome = cache
+            .purge(target, PurgeType::Eviction, &Span::inactive().handle())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, crate::storage::PurgeOutcome::NotFound);
+        assert!(cache.cached.read().contains_key(&hash));
+    }
+
+    #[tokio::test]
+    async fn test_exact_key_only_purge_succeeds_and_removes_entry() {
+        static MEM_CACHE: Lazy<MemCache> = Lazy::new(MemCache::new);
+        let cache = &MEM_CACHE;
+        let key = CacheKey::new("key-only", "1").to_compact();
+        let hash = key.combined();
+        cache.cached.write().insert(
+            hash,
+            CacheObject {
+                meta: (Vec::new(), Vec::new()),
+                body: Arc::new(Vec::new()),
+            },
+        );
+
+        let entry = CacheEntryKey::key_only(key);
+        let outcome = cache
+            .purge(
+                crate::storage::PurgeTarget::Exact(&entry),
+                PurgeType::Eviction,
+                &Span::inactive().handle(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, crate::storage::PurgeOutcome::Purged(None));
+        assert!(cache.cached.read().is_empty());
     }
 }
