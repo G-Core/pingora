@@ -426,7 +426,7 @@ impl Storage for MemCache {
         if matches!(target, PurgeTarget::Exact(CacheEntryKey::Identified { .. })) {
             return Ok(PurgeOutcome::NotFound);
         }
-        let hash = target.key().combined();
+        let hash = target.key().combined_bin();
         // Unlike purge this leaves `temp` alone. An in-flight miss has no committed meta to
         // rewrite, and expiring what it is about to store would discard a fresh response.
         // The guard covers the whole read-modify-write so concurrent expires cannot clobber
