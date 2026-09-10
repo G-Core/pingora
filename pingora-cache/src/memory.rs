@@ -706,7 +706,7 @@ mod test {
 
         let key = CacheKey::new("expire-me", "1");
         let compact = key.to_compact();
-        let hash = compact.combined();
+        let hash = compact.combined_bin();
         let body = vec![1, 2, 3];
         let fresh = CacheMeta::new(
             SystemTime::now() + std::time::Duration::from_secs(300),
@@ -719,7 +719,7 @@ mod test {
             hash.clone(),
             CacheObject {
                 meta: fresh.serialize().unwrap(),
-                body: Arc::new(body.clone()),
+                body: Bytes::from(body.clone()),
             },
         );
 
