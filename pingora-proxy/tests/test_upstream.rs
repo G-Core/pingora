@@ -5476,6 +5476,9 @@ mod test_cache {
         assert_eq!(res.text().await.unwrap(), "hello world");
 
         // predicted uncacheable (note upstream endpoint doesn't support range)
+        // sleep briefly so nginx's cached `ngx.now()` (updated once per event loop
+        // tick) has advanced, otherwise both requests can observe the same epoch
+        sleep(Duration::from_millis(50)).await;
         let res = send_max_file_size_req(url, 1, Some((1, 4))).await;
         assert_eq!(res.status(), StatusCode::OK);
         let headers = res.headers();

@@ -320,9 +320,10 @@ mod tests {
     #[test]
     fn test_eviction() {
         let cache: MemoryCache<i32, i32> = MemoryCache::new(2);
-        cache.put(&1, 2, None);
-        cache.put(&2, 4, None);
-        cache.put(&3, 6, None);
+        // use force_put to bypass the TinyLFU admission policy so eviction is deterministic
+        cache.force_put(&1, 2, None);
+        cache.force_put(&2, 4, None);
+        cache.force_put(&3, 6, None);
         let (res, hit) = cache.get(&1);
         assert_eq!(res, None);
         assert_eq!(hit, CacheStatus::Miss);
