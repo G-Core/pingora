@@ -716,7 +716,7 @@ mod test {
             ResponseHeader::build(200, None).unwrap(),
         );
         cache.cached.write().insert(
-            hash.clone(),
+            hash,
             CacheObject {
                 meta: fresh.serialize().unwrap(),
                 body: Bytes::from(body.clone()),
