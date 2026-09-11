@@ -237,12 +237,14 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
                 Ok(io) => {
                     let app = app_logic.clone();
                     let shutdown = shutdown.clone();
+                    let lifetime_guard = app.on_new_connection(&mut || io.local_addr());
                     let handle = if is_no_steal {
                         Handle::current()
                     } else {
                         current_handle()
                     };
                     handle.spawn(async move {
+                        let _lifetime_guard = lifetime_guard;
                         let peer_addr = io.peer_addr();
                         match timeout(Duration::from_secs(60), io.handshake()).await {
                             Ok(handshake) => {

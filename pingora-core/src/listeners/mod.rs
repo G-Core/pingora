@@ -403,6 +403,13 @@ impl UninitializedStream {
             .get_socket_digest()
             .and_then(|d| d.peer_addr().cloned())
     }
+
+    /// Get the local address of the connection if available
+    pub(crate) fn local_addr(&self) -> Option<SocketAddr> {
+        self.l4
+            .get_socket_digest()
+            .and_then(|d| d.local_addr().cloned())
+    }
 }
 
 /// The struct to hold one more multiple listening endpoints

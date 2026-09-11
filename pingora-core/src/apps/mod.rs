@@ -34,6 +34,27 @@ use crate::protocols::ALPN;
 // https://datatracker.ietf.org/doc/html/rfc9113#section-3.4
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
+/// RAII handle returned by [`ServerApp::on_new_connection`]: brackets an accepted
+/// connection's whole lifecycle, including one that stalls or fails during handshake
+/// and never reaches [`ServerApp::process_new`]. `dec` runs on whichever worker thread
+/// ends the connection, so the counter it touches must be thread-safe.
+pub struct ConnectionLifetimeGuard(Option<Box<dyn FnOnce() + Send>>);
+
+impl ConnectionLifetimeGuard {
+    pub fn new(inc: impl FnOnce(), dec: impl FnOnce() + Send + 'static) -> Self {
+        inc();
+        Self(Some(Box::new(dec)))
+    }
+}
+
+impl Drop for ConnectionLifetimeGuard {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
 #[async_trait]
 /// This trait defines the interface of a transport layer (TCP or TLS) application.
 pub trait ServerApp {
@@ -55,6 +76,17 @@ pub trait ServerApp {
         // TODO: make this ShutdownWatch so that all task can await on this event
         shutdown: &ShutdownWatch,
     ) -> Option<Stream>;
+
+    /// Called once for each accepted connection, immediately after the socket is
+    /// accepted and **before** the TLS/HTTP handshake. An implementation may return
+    /// a [`ConnectionLifetimeGuard`] to bracket the connection.
+    /// `local_addr` is lazy, so the default path pays no `getsockname`.
+    fn on_new_connection(
+        &self,
+        _local_addr: &mut dyn FnMut() -> Option<crate::protocols::l4::socket::SocketAddr>,
+    ) -> Option<ConnectionLifetimeGuard> {
+        None
+    }
 
     /// This callback will be called once after the service stops listening to its endpoints.
     async fn cleanup(&self) {}
