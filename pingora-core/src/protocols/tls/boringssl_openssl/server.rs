@@ -16,7 +16,6 @@
 
 use crate::listeners::tls::client_hello_data;
 use crate::listeners::TlsAccept;
-use crate::listeners::TlsAcceptCallbacks;
 use crate::protocols::tls::SslStream;
 use crate::protocols::{Shutdown, IO};
 use crate::tls::ext;
@@ -54,10 +53,13 @@ pub async fn handshake_with_callback<S: IO>(
     callbacks: &(dyn TlsAccept + Send + Sync),
 ) -> Result<SslStream<S>> {
     let mut tls_stream = prepare_tls_stream(ssl_acceptor, io)?;
-    let done = Pin::new(&mut tls_stream)
-        .start_accept()
-        .await
-        .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
+    let done = match Pin::new(&mut tls_stream).start_accept().await {
+        Ok(done) => done,
+        Err(e) => {
+            callbacks.handshake_failed_callback(&e).await;
+            Err(e).explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?
+        }
+    };
     // The captured `TlsClientHello` was stashed into BoringSSL `ex_data` during
     // the `select_certificate_callback` (see `set_client_hello_data` in the
     // listeners module).  Retrieve it here so we can attach it to the digest
@@ -67,10 +69,13 @@ pub async fn handshake_with_callback<S: IO>(
         // safety: we do hold a mut ref of tls_stream
         let ssl_mut = unsafe { ext::ssl_mut(tls_stream.ssl()) };
         callbacks.certificate_callback(ssl_mut).await;
-        Pin::new(&mut tls_stream)
-            .resume_accept()
-            .await
-            .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
+        match Pin::new(&mut tls_stream).resume_accept().await {
+            Ok(()) => {}
+            Err(e) => {
+                callbacks.handshake_failed_callback(&e).await;
+                Err(e).explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
+            }
+        }
     }
     {
         if let Some(digest_mut) = tls_stream.ssl_digest_mut() {

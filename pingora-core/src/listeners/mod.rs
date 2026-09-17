@@ -92,6 +92,8 @@ pub use crate::protocols::l4::stream::{
 };
 pub use crate::protocols::tls::ALPN;
 use crate::protocols::GetSocketDigest;
+#[cfg(feature = "openssl_derived")]
+use crate::tls::ssl;
 pub use l4::{ServerAddress, TcpSocketOptions};
 
 /// The APIs to customize things like certificate during TLS server side handshake
@@ -118,6 +120,18 @@ pub trait TlsAccept {
     ) -> Option<Arc<dyn Any + Send + Sync>> {
         None
     }
+
+    /// This function is called when the TLS server-side handshake fails before
+    /// completing, carrying the underlying `ssl::Error` that caused the failure.
+    ///
+    /// It fires only for the callback-based accept path (`handshake_with_callback`),
+    /// where a `TlsAccept` object is installed. It covers the `start_accept` and
+    /// `resume_accept` stages; it does not fire for `prepare_tls_stream` setup
+    /// errors, which produce `ErrorStack`-based `pingora_error::Error` values
+    /// rather than `ssl::Error`. Implementations can use this to record
+    /// handshake-outcome metrics without altering the returned error.
+    #[cfg(feature = "openssl_derived")]
+    async fn handshake_failed_callback(&self, _err: &ssl::Error) -> () {}
 }
 
 pub type TlsAcceptCallbacks = Box<dyn TlsAccept + Send + Sync>;
