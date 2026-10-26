@@ -109,7 +109,7 @@ where
         self.threads
     }
 
-    fn listen_addresses(&self) -> Option<Vec<String>> {
+    fn listen_addresses(&self, _threads: usize, _work_stealing: bool) -> Option<Vec<String>> {
         Some(Vec::new())
     }
 }

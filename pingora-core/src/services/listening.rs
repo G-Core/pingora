@@ -431,7 +431,7 @@ where
             .and_then(|override_fn| override_fn(global))
     }
 
-    fn listen_addresses(&self) -> Option<Vec<String>> {
-        Some(self.listeners.addresses())
+    fn listen_addresses(&self, threads: usize, work_stealing: bool) -> Option<Vec<String>> {
+        Some(self.listeners.expected_fd_keys(threads, work_stealing))
     }
 }

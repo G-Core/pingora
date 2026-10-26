@@ -434,6 +434,10 @@ pub struct Listeners {
     pre_tls_callback: Option<PreTlsCallback>,
 }
 
+fn thread_fd_key(addr: &str, thread_idx: usize) -> String {
+    format!("{addr}#{thread_idx}")
+}
+
 impl Listeners {
     /// Create a new [`Listeners`] with no listening endpoints.
     pub fn new() -> Self {
@@ -516,12 +520,22 @@ impl Listeners {
         self.add_endpoint(addr, None);
     }
 
-    /// The configured bind addresses, using the keys expected by transferred listening fds.
-    pub fn addresses(&self) -> Vec<String> {
-        self.stacks
-            .iter()
-            .map(|stack| stack.l4.as_ref().to_string())
-            .collect()
+    /// The exact fd-table keys this listener set claims after a graceful upgrade.
+    ///
+    /// Mirrors the key format used when binding: a NoSteal TCP endpoint claims `addr#0..threads-1`
+    /// in addition to the bare `addr` key it inherits from a legacy single-socket process; every
+    /// other endpoint (work-stealing TCP, or a shared UDS path) claims only its bare address.
+    pub(crate) fn expected_fd_keys(&self, threads: usize, work_stealing: bool) -> Vec<String> {
+        let mut keys = Vec::new();
+        for stack in &self.stacks {
+            let addr = stack.l4.as_ref();
+            let per_thread = !work_stealing && matches!(stack.l4, ServerAddress::Tcp(_, _));
+            keys.push(addr.to_string());
+            if per_thread {
+                keys.extend((0..threads).map(|idx| thread_fd_key(addr, idx)));
+            }
+        }
+        keys
     }
 
     /// Set a connection filter for all endpoints in this listener collection
@@ -654,6 +668,51 @@ mod test {
     #[cfg(feature = "any_tls")]
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
+
+    #[test]
+    fn thread_fd_key_pins_the_per_thread_format() {
+        assert_eq!(thread_fd_key("127.0.0.1:80", 0), "127.0.0.1:80#0");
+        assert_eq!(thread_fd_key("/tmp/a.sock", 12), "/tmp/a.sock#12");
+    }
+
+    #[test]
+    fn expected_fd_keys_expands_tcp_per_thread_in_nosteal() {
+        let mut listeners = Listeners::new();
+        listeners.add_tcp("127.0.0.1:80");
+
+        assert_eq!(
+            listeners.expected_fd_keys(3, false),
+            vec![
+                "127.0.0.1:80".to_string(),
+                "127.0.0.1:80#0".to_string(),
+                "127.0.0.1:80#1".to_string(),
+                "127.0.0.1:80#2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn expected_fd_keys_keeps_only_bare_tcp_key_when_work_stealing() {
+        let mut listeners = Listeners::new();
+        listeners.add_tcp("127.0.0.1:80");
+
+        assert_eq!(
+            listeners.expected_fd_keys(4, true),
+            vec!["127.0.0.1:80".to_string()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expected_fd_keys_keeps_shared_uds_key_in_nosteal() {
+        let mut listeners = Listeners::new();
+        listeners.add_uds("/tmp/pingora_expected.sock", None);
+
+        assert_eq!(
+            listeners.expected_fd_keys(4, false),
+            vec!["/tmp/pingora_expected.sock".to_string()]
+        );
+    }
 
     #[tokio::test]
     async fn test_listen_tcp() {

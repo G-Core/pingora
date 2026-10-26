@@ -348,7 +348,8 @@ pub trait ServiceWithDependents: Send + Sync {
     }
 
     /// See [`Service::listen_addresses`].
-    fn listen_addresses(&self) -> Option<Vec<String>> {
+    fn listen_addresses(&self, threads: usize, work_stealing: bool) -> Option<Vec<String>> {
+        let _ = (threads, work_stealing);
         None
     }
 }
@@ -394,8 +395,8 @@ where
         S::on_startup_delay(self, time_waited)
     }
 
-    fn listen_addresses(&self) -> Option<Vec<String>> {
-        S::listen_addresses(self)
+    fn listen_addresses(&self, threads: usize, work_stealing: bool) -> Option<Vec<String>> {
+        S::listen_addresses(self, threads, work_stealing)
     }
 }
 
@@ -460,11 +461,13 @@ pub trait Service: Sync + Send {
         );
     }
 
-    /// The bind addresses of the listening sockets this service owns.
+    /// The exact fd-table keys of the listening sockets this service expects to claim.
     ///
-    /// Addresses must match the keys used for transferred listening fds. Return [`None`] (the
-    /// default) if the service may consume fds without declaring every key; this disables cleanup.
-    fn listen_addresses(&self) -> Option<Vec<String>> {
+    /// `threads` and `work_stealing` describe the runtime this service will run in, so the keys
+    /// match the ones it will derive when it binds its listeners. Return [`None`] (the default) if
+    /// the service may consume fds without declaring every key; this disables cleanup.
+    fn listen_addresses(&self, threads: usize, work_stealing: bool) -> Option<Vec<String>> {
+        let _ = (threads, work_stealing);
         None
     }
 }

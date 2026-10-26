@@ -379,13 +379,22 @@ impl Server {
         self.bootstrap.lock().get_fds()
     }
 
+    fn service_runtime(&self, service: &dyn ServiceWithDependents) -> (usize, bool) {
+        let conf = self.configuration.as_ref();
+        (
+            service.threads().unwrap_or(conf.threads),
+            conf.work_stealing,
+        )
+    }
+
     /// Collect the listening bind addresses across all registered services.
     #[cfg(unix)]
     fn collect_listen_addresses(&self) -> Option<std::collections::HashSet<String>> {
         self.services
             .values()
             .try_fold(std::collections::HashSet::new(), |mut addrs, wrapper| {
-                addrs.extend(wrapper.service.listen_addresses()?);
+                let (threads, work_stealing) = self.service_runtime(wrapper.service.as_ref());
+                addrs.extend(wrapper.service.listen_addresses(threads, work_stealing)?);
                 Some(addrs)
             })
     }
@@ -728,7 +737,7 @@ impl Server {
                 }
             };
 
-            let threads = wrapper.service.threads().unwrap_or(conf.threads);
+            let (threads, work_stealing) = self.service_runtime(wrapper.service.as_ref());
             let name = wrapper.service.name().to_string();
             let service_runtime_opts = wrapper
                 .service
@@ -769,7 +778,7 @@ impl Server {
                 self.listen_fds(),
                 self.shutdown_recv.clone(),
                 threads,
-                conf.work_stealing,
+                work_stealing,
                 self.configuration.listener_tasks_per_fd,
                 ready_notifier,
                 dependency_watches,

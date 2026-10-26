@@ -131,26 +131,31 @@ impl Fds {
         Ok(())
     }
 
-    /// Close and remove inherited listening fds whose bind addresses are absent from `keep`.
+    /// Close and remove listening fds whose bind addresses are absent from `keep`, in both the
+    /// claimed store and the inherited-pending store.
     ///
-    /// An unclaimed `SO_REUSEPORT` socket remains active without an acceptor and can black-hole
+    /// The keys are matched exactly: an inherited key the new process does not expect (a dropped
+    /// port, or a per-thread shard beyond the new thread count) is unmatched and closed. An
+    /// unclaimed `SO_REUSEPORT` socket remains active without an acceptor and can black-hole
     /// connections. Removing it also prevents it from being transferred to the next process.
     /// Returns the addresses removed from the table.
     #[cfg(unix)]
     pub fn close_unclaimed(&mut self, keep: &HashSet<String>) -> Vec<String> {
         let mut closed = Vec::new();
-        self.map.retain(|bind, fd| {
-            if keep.contains(bind) {
-                return true;
-            }
-            if let Err(e) = nix::unistd::close(*fd) {
-                log::warn!(
-                    "Failed to close orphaned inherited listening socket fd {fd} ({bind}): {e}"
-                );
-            }
-            closed.push(bind.clone());
-            false
-        });
+        for store in [&mut self.map, &mut self.inherited_pending] {
+            store.retain(|bind, fd| {
+                if keep.contains(bind) {
+                    return true;
+                }
+                if let Err(e) = nix::unistd::close(*fd) {
+                    log::warn!(
+                        "Failed to close orphaned inherited listening socket fd {fd} ({bind}): {e}"
+                    );
+                }
+                closed.push(bind.clone());
+                false
+            });
+        }
         closed
     }
 }
@@ -1129,6 +1134,26 @@ mod close_unclaimed_tests {
     // A second owning handle would turn a wrongly closed descriptor into an I/O
     // safety abort of the whole binary, so `Fds` gets raw numbers.
 
+    /// A socket pair whose peer observes the local end's lifecycle: it reports
+    /// `Ok(0)` once the local descriptor (and every duplicate) is closed, and
+    /// `WouldBlock` while it stays open.
+    fn pair() -> (UnixStream, i32) {
+        let (peer, local) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        (peer, local.into_raw_fd())
+    }
+
+    fn assert_closed(mut peer: UnixStream, ctx: &str) {
+        assert!(matches!(peer.read(&mut [0u8; 1]), Ok(0)), "{ctx}");
+    }
+
+    fn assert_open(mut peer: UnixStream, ctx: &str) {
+        assert!(
+            matches!(peer.read(&mut [0u8; 1]), Err(e) if e.kind() == ErrorKind::WouldBlock),
+            "{ctx}"
+        );
+    }
+
     #[test]
     fn closes_only_unclaimed_fds() {
         let (mut keep_peer, keep_local) = UnixStream::pair().unwrap();
@@ -1180,5 +1205,147 @@ mod close_unclaimed_tests {
             matches!(peer.read(&mut [0u8; 1]), Ok(0)),
             "the unclaimed descriptor was not closed"
         );
+    }
+
+    /// The real upgrade path delivers fds into `inherited_pending` via `deserialize`, so the
+    /// prune must match keys there too — not only in the claimed `map`.
+    #[test]
+    fn close_unclaimed_matches_received_fds_by_exact_key() {
+        let (stale_peer, stale) = pair();
+        let (kept_peer, kept) = pair();
+        let (beyond_peer, beyond) = pair();
+        let (undeclared_peer, undeclared) = pair();
+        let (dropped_shard0_peer, dropped_shard0) = pair();
+        let (dropped_shard1_peer, dropped_shard1) = pair();
+
+        let mut fds = Fds::new();
+        fds.deserialize(
+            vec![
+                "127.0.0.1:80".to_string(),
+                "127.0.0.1:80#0".to_string(),
+                "127.0.0.1:80#2".to_string(),
+                "127.0.0.1:9090".to_string(),
+                "127.0.0.1:9090#0".to_string(),
+                "127.0.0.1:9090#1".to_string(),
+            ],
+            vec![
+                stale,
+                kept,
+                beyond,
+                undeclared,
+                dropped_shard0,
+                dropped_shard1,
+            ],
+        );
+
+        // A NoSteal service with two threads expects the bare key plus addr#0 and addr#1.
+        let keep: HashSet<String> = ["127.0.0.1:80", "127.0.0.1:80#0", "127.0.0.1:80#1"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let mut closed = fds.close_unclaimed(&keep);
+        closed.sort();
+
+        assert_eq!(
+            closed,
+            vec![
+                "127.0.0.1:80#2".to_string(),
+                "127.0.0.1:9090".to_string(),
+                "127.0.0.1:9090#0".to_string(),
+                "127.0.0.1:9090#1".to_string(),
+            ],
+            "only the shard beyond the thread count and the undeclared port shards should be closed"
+        );
+        assert!(fds.get("127.0.0.1:80").is_some(), "legacy bare key pruned");
+        assert!(
+            fds.get("127.0.0.1:80#0").is_some(),
+            "configured shard pruned"
+        );
+        assert!(fds.get("127.0.0.1:80#2").is_none(), "extra shard kept");
+        assert!(fds.get("127.0.0.1:9090").is_none(), "undeclared port kept");
+        assert!(
+            fds.get("127.0.0.1:9090#0").is_none(),
+            "undeclared port shard kept"
+        );
+        assert!(
+            fds.get("127.0.0.1:9090#1").is_none(),
+            "undeclared port shard kept"
+        );
+
+        assert_open(stale_peer, "the legacy bare key was closed");
+        assert_open(kept_peer, "the configured shard was closed");
+        assert_closed(beyond_peer, "the extra shard was not closed");
+        assert_closed(undeclared_peer, "the undeclared port was not closed");
+        assert_closed(
+            dropped_shard0_peer,
+            "the undeclared port shard was not closed",
+        );
+        assert_closed(
+            dropped_shard1_peer,
+            "the undeclared port shard was not closed",
+        );
+    }
+
+    #[test]
+    fn empty_keep_closes_received_fds() {
+        let (a_peer, a) = pair();
+        let (b_peer, b) = pair();
+
+        let mut fds = Fds::new();
+        fds.deserialize(
+            vec!["127.0.0.1:80#0".to_string(), "unix.sock".to_string()],
+            vec![a, b],
+        );
+
+        let mut closed = fds.close_unclaimed(&HashSet::new());
+        closed.sort();
+
+        assert_eq!(
+            closed,
+            vec!["127.0.0.1:80#0".to_string(), "unix.sock".to_string()]
+        );
+        assert_closed(a_peer, "received fd was not closed");
+        assert_closed(b_peer, "received fd was not closed");
+    }
+
+    /// A shared Unix-domain listener is claimed under its bare key in every mode.
+    #[test]
+    fn close_unclaimed_retains_shared_uds_key() {
+        let (peer, fd) = pair();
+
+        let mut fds = Fds::new();
+        fds.deserialize(vec!["/tmp/pingora_shared.sock".to_string()], vec![fd]);
+
+        let keep: HashSet<String> = ["/tmp/pingora_shared.sock".to_string()]
+            .into_iter()
+            .collect();
+        let closed = fds.close_unclaimed(&keep);
+
+        assert!(closed.is_empty(), "the shared UDS key must survive");
+        assert!(fds.get("/tmp/pingora_shared.sock").is_some());
+        assert_open(peer, "the shared UDS listener was closed");
+    }
+
+    #[test]
+    fn close_unclaimed_matches_claimed_fds_by_exact_key() {
+        let (keep_peer, keep_fd) = pair();
+        let (drop_peer, drop_fd) = pair();
+
+        let mut fds = Fds::new();
+        fds.add("127.0.0.1:80#0".to_string(), keep_fd);
+        fds.add("127.0.0.1:80#5".to_string(), drop_fd);
+
+        let keep: HashSet<String> = ["127.0.0.1:80#0".to_string()].into_iter().collect();
+        let closed = fds.close_unclaimed(&keep);
+
+        assert_eq!(closed, vec!["127.0.0.1:80#5".to_string()]);
+        assert_eq!(*fds.get("127.0.0.1:80#0").unwrap(), keep_fd);
+        assert!(fds.get("127.0.0.1:80#5").is_none());
+        assert_open(keep_peer, "the expected claimed fd was closed");
+        assert_closed(drop_peer, "the unexpected claimed fd was not closed");
+
+        // `Fds` does not close claimed (`map`) entries on drop.
+        // SAFETY: asserted open just above, and no other owner remains.
+        drop(unsafe { OwnedFd::from_raw_fd(keep_fd) });
     }
 }

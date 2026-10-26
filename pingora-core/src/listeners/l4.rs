@@ -513,7 +513,7 @@ impl ListenerEndpointBuilder {
         }
 
         let addr_str = listen_addr.as_ref();
-        let thread_key = format!("{}#{}", addr_str, thread_idx);
+        let thread_key = super::thread_fd_key(addr_str, thread_idx);
 
         // Two possible outcomes determined while holding the lock:
         enum Action {
@@ -895,6 +895,69 @@ mod test {
 
         // Verify the first listener still works
         assert_eq!(listener1.as_str(), addr);
+    }
+
+    /// A legacy bare-key `SO_REUSEPORT` TCP socket survives the load-time prune and thread 0
+    /// wraps the same fd, migrating the table entry from `addr` to `addr#0` without a rebind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inherited_bare_key_socket_is_reused_by_thread_zero() {
+        use crate::listeners::Listeners;
+        use crate::server::Fds;
+        use parking_lot::Mutex;
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::collections::HashSet;
+
+        // An inherited fd arrives over SCM_RIGHTS as a bare listening socket, never registered
+        // with a tokio reactor — so build it with socket2 directly.
+        let legacy = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        legacy.set_reuse_address(true).unwrap();
+        legacy.set_reuse_port(true).unwrap();
+        let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        legacy.bind(&bind_addr.into()).unwrap();
+        legacy.listen(128).unwrap();
+        let addr = legacy
+            .local_addr()
+            .unwrap()
+            .as_socket()
+            .unwrap()
+            .to_string();
+        let legacy_fd = legacy.as_raw_fd();
+        // The fd table takes raw ownership of the number; keep this handle from closing it.
+        std::mem::forget(legacy);
+
+        let fds: ListenFds = Arc::new(Mutex::new(Fds::new()));
+        fds.lock().deserialize(vec![addr.clone()], vec![legacy_fd]);
+
+        // A NoSteal service with two threads keeps the bare key alongside addr#0/addr#1.
+        let mut declared = Listeners::new();
+        declared.add_tcp(&addr);
+        let keep: HashSet<String> = declared.expected_fd_keys(2, false).into_iter().collect();
+        assert!(fds.lock().close_unclaimed(&keep).is_empty());
+        assert!(fds.lock().get(&addr).is_some(), "bare key pruned");
+
+        let mut builder = ListenerEndpoint::builder();
+        builder.listen_addr(ServerAddress::Tcp(addr.clone(), None));
+        let endpoint = builder
+            .listen_for_thread(Some(fds.clone()), 0)
+            .await
+            .unwrap();
+
+        {
+            let table = fds.lock();
+            assert_eq!(
+                *table.get(&format!("{addr}#0")).unwrap(),
+                legacy_fd,
+                "thread 0 did not adopt the inherited fd"
+            );
+            assert!(
+                table.get(&addr).is_none(),
+                "the bare key was not migrated to the per-thread key"
+            );
+        }
+        // The endpoint wraps the same fd the table holds under addr#0, not a fresh rebind.
+        assert_eq!(endpoint.listener.as_raw_fd(), legacy_fd);
+        assert_eq!(endpoint.local_addr().unwrap().to_string(), addr);
     }
 
     #[cfg(feature = "connection_filter")]

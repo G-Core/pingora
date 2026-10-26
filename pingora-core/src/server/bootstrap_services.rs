@@ -340,4 +340,61 @@ mod tests {
         // SAFETY: asserted open just above, and no other owner remains.
         drop(unsafe { OwnedFd::from_raw_fd(keep_fd) });
     }
+
+    /// Seed the fds through the real upgrade receive path (a socket send/receive), then run the
+    /// load-time prune. This is the ordering a graceful upgrade uses; the `add`-seeded test above
+    /// cannot see a regression that only affects freshly received descriptors.
+    #[test]
+    fn load_path_prunes_received_unclaimed_fd() {
+        let conf = ServerConf {
+            upgrade_sock: format!("/tmp/pingora_bootstrap_prune_{}.sock", std::process::id()),
+            ..Default::default()
+        };
+        let upgrade_sock = conf.upgrade_sock.clone();
+        let (execution_phase_watch, _) = broadcast::channel(1);
+        let mut bootstrap = Bootstrap::new(&None, &conf, &execution_phase_watch);
+
+        let (mut keep_peer, keep_local) = UnixStream::pair().unwrap();
+        let (mut drop_peer, drop_local) = UnixStream::pair().unwrap();
+        keep_peer.set_nonblocking(true).unwrap();
+        drop_peer.set_nonblocking(true).unwrap();
+        let keep_fd = keep_local.into_raw_fd();
+        let drop_fd = drop_local.into_raw_fd();
+
+        let sender = std::thread::spawn(move || {
+            let mut out = Fds::new();
+            // "127.0.0.1:80#0" is a configured per-thread key; "127.0.0.1:9090" is a dropped port.
+            out.add("127.0.0.1:80#0".to_string(), keep_fd);
+            out.add("127.0.0.1:9090".to_string(), drop_fd);
+            out.send_to_sock(upgrade_sock.as_str()).unwrap();
+            // `Fds` leaves `map` entries open on drop; close the sender's copies so the peer
+            // ends report closure once the receiver's duplicates are gone.
+            nix::unistd::close(keep_fd).unwrap();
+            nix::unistd::close(drop_fd).unwrap();
+        });
+
+        bootstrap.set_expected_listen_addrs(["127.0.0.1:80#0".to_string()].into_iter().collect());
+        bootstrap.load_fds(true).unwrap();
+        sender.join().unwrap();
+
+        {
+            let fds = bootstrap.listen_fds.lock();
+            assert!(
+                fds.get("127.0.0.1:80#0").is_some(),
+                "the configured per-thread fd was pruned"
+            );
+            assert!(
+                fds.get("127.0.0.1:9090").is_none(),
+                "the unconfigured fd survived the load-time prune"
+            );
+        }
+        assert!(
+            matches!(drop_peer.read(&mut [0u8; 1]), Ok(0)),
+            "the unconfigured inherited fd was not closed"
+        );
+        assert!(
+            matches!(keep_peer.read(&mut [0u8; 1]), Err(e) if e.kind() == ErrorKind::WouldBlock),
+            "the configured inherited fd was closed"
+        );
+    }
 }
