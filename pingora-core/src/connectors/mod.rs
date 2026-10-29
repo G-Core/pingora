@@ -249,6 +249,12 @@ impl TransportConnector {
 
     /// Try to find a reusable connection to the given server [Peer]
     pub async fn reused_stream<P: Peer + Send + Sync>(&self, peer: &P) -> Option<Stream> {
+        if peer
+            .get_peer_options()
+            .is_some_and(|o| o.disable_keepalive_reuse)
+        {
+            return None;
+        }
         match self.connection_pool.get(&peer.reuse_hash()) {
             Some(s) => {
                 debug!("find reusable stream, trying to acquire it");

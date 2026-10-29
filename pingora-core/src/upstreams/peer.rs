@@ -502,6 +502,10 @@ pub struct PeerOptions {
     pub total_connection_timeout: Option<Duration>,
     pub read_timeout: Option<Duration>,
     pub idle_timeout: Option<Duration>,
+    /// Never take a connection from a reuse pool for this peer: acquiring a session
+    /// always opens a fresh connection. Releasing it is unchanged, so the fresh
+    /// connection is pooled under the normal key for later reuse.
+    pub disable_keepalive_reuse: bool,
     pub write_timeout: Option<Duration>,
     pub verify_cert: bool,
     pub verify_hostname: bool,
@@ -578,6 +582,7 @@ impl PeerOptions {
             total_connection_timeout: None,
             read_timeout: None,
             idle_timeout: None,
+            disable_keepalive_reuse: false,
             write_timeout: None,
             verify_cert: true,
             verify_hostname: true,

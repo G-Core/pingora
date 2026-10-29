@@ -397,6 +397,12 @@ impl Connector {
         &self,
         peer: &P,
     ) -> Result<Option<Http2Session>> {
+        if peer
+            .get_peer_options()
+            .is_some_and(|o| o.disable_keepalive_reuse)
+        {
+            return Ok(None);
+        }
         // check in use pool first so that we use fewer total connections
         // then idle pool
         let reuse_hash = peer.reuse_hash();
@@ -806,6 +812,78 @@ mod tests {
         // all streams are released, now the connection is idle
         let h2_5 = connector.reused_http_session(&peer).await.unwrap().unwrap();
         assert_eq!(id, h2_5.conn.id());
+    }
+
+    #[tokio::test]
+    async fn disable_keepalive_reuse_skips_a_pooled_h2_connection() {
+        let (address, server) = spawn_h2_origin().await;
+        let connector = Connector::new(None);
+        let mut peer = HttpPeer::new(address, false, "".into());
+        peer.options.set_http_version(2, 2);
+
+        let seeded = connector
+            .new_http_session::<HttpPeer, ()>(&peer)
+            .await
+            .unwrap();
+        let seeded = match seeded {
+            HttpSession::H2(s) => s,
+            _ => panic!("expect h2"),
+        };
+        let seeded_id = seeded.conn.id();
+        connector.release_http_session(seeded, &peer, None);
+
+        let reused = connector.reused_http_session(&peer).await.unwrap().unwrap();
+        assert_eq!(reused.conn.id(), seeded_id);
+        connector.release_http_session(reused, &peer, None);
+
+        let mut flagged = peer.clone();
+        flagged.options.disable_keepalive_reuse = true;
+        assert!(connector
+            .reused_http_session(&flagged)
+            .await
+            .unwrap()
+            .is_none());
+
+        let fresh = connector
+            .new_http_session::<HttpPeer, ()>(&flagged)
+            .await
+            .unwrap();
+        let fresh = match fresh {
+            HttpSession::H2(s) => s,
+            _ => panic!("expect h2"),
+        };
+        assert_ne!(
+            fresh.conn.id(),
+            seeded_id,
+            "fallback acquisition must open a new connection"
+        );
+        connector.release_http_session(fresh, &flagged, None);
+
+        server.abort();
+    }
+
+    async fn spawn_h2_origin() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut conn = match h2::server::handshake(stream).await {
+                        Ok(conn) => conn,
+                        Err(_) => return,
+                    };
+                    while let Some(Ok((request, mut respond))) = conn.accept().await {
+                        let mut body = request.into_body();
+                        while body.data().await.is_some() {}
+                        let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                        if let Ok(mut respond) = respond.send_response(resp, false) {
+                            let _ = respond.send_data(Bytes::new(), true);
+                        }
+                    }
+                });
+            }
+        });
+        (address, server)
     }
 
     /// `spawn_stream` must return `Ok(None)` and mark the connection as shutting

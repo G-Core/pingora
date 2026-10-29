@@ -118,6 +118,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disable_keepalive_reuse_skips_a_pooled_connection() {
+        use std::sync::atomic::Ordering;
+
+        let (address, connections, server) = spawn_origin().await;
+        let connector = Connector::new(None);
+        let peer = HttpPeer::new(address, false, "".into());
+
+        let (mut seeded, reused) = connector.get_http_session(&peer).await.unwrap();
+        assert!(!reused);
+        get_http(&mut seeded, 200).await;
+        connector.release_http_session(seeded, &peer, None).await;
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+
+        let mut flagged = peer.clone();
+        flagged.options.disable_keepalive_reuse = true;
+        let (mut fresh, reused) = connector.get_http_session(&flagged).await.unwrap();
+        assert!(
+            !reused,
+            "flagged acquisition must not reuse the pooled connection"
+        );
+        get_http(&mut fresh, 200).await;
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            2,
+            "flagged acquisition must open a new connection"
+        );
+        connector.release_http_session(fresh, &flagged, None).await;
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn flagged_acquisition_is_still_pooled_on_release() {
+        use std::sync::atomic::Ordering;
+
+        let (address, connections, server) = spawn_origin().await;
+        let connector = Connector::new(None);
+        let peer = HttpPeer::new(address, false, "".into());
+        let mut flagged = peer.clone();
+        flagged.options.disable_keepalive_reuse = true;
+
+        // On an empty pool the flagged acquisition is the only connection there is.
+        let (mut fresh, reused) = connector.get_http_session(&flagged).await.unwrap();
+        assert!(!reused);
+        get_http(&mut fresh, 200).await;
+        connector.release_http_session(fresh, &flagged, None).await;
+
+        // Release is unflagged, so the released connection is pooled and the next
+        // unflagged acquisition reuses it rather than opening a new one.
+        let (mut pooled, reused) = connector.get_http_session(&peer).await.unwrap();
+        assert!(reused, "the released connection must be reusable");
+        get_http(&mut pooled, 200).await;
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        connector.release_http_session(pooled, &peer, None).await;
+
+        server.abort();
+    }
+
+    async fn spawn_origin() -> (
+        std::net::SocketAddr,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&connections);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        if stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        (address, connections, server)
+    }
+
+    #[tokio::test]
     async fn malformed_response_is_not_returned_to_pool() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

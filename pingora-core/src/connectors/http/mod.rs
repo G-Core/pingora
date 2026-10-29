@@ -68,19 +68,22 @@ where
         peer: &P,
     ) -> Result<(HttpSession<C::Session>, bool)> {
         let peer_opts = peer.get_peer_options();
+        let reuse_disabled = peer_opts.is_some_and(|o| o.disable_keepalive_reuse);
 
         // Switch to custom protocol as early as possible
         if peer_opts.is_some_and(|o| matches!(o.alpn, ALPN::Custom(_))) {
             // We create the Connector before TLS, so we need to make sure that the server also supports the same custom protocol.
             // We will first check for sessions that we can reuse, if not we will create a new one based on the negotiated protocol
 
-            // Step 1: Look for reused Custom Session
-            if let Some(session) = self.custom.reused_http_session(peer).await {
-                return Ok((HttpSession::Custom(session), true));
-            }
-            // Step 2: Check reuse pool for reused H1 session
-            if let Some(h1) = self.h1.reused_http_session(peer).await {
-                return Ok((HttpSession::H1(h1), true));
+            if !reuse_disabled {
+                // Step 1: Look for reused Custom Session
+                if let Some(session) = self.custom.reused_http_session(peer).await {
+                    return Ok((HttpSession::Custom(session), true));
+                }
+                // Step 2: Check reuse pool for reused H1 session
+                if let Some(h1) = self.h1.reused_http_session(peer).await {
+                    return Ok((HttpSession::H1(h1), true));
+                }
             }
             // Step 3: Try and create a new Custom session
             let (connection, reused) = self.custom.get_http_session(peer).await?;
@@ -483,6 +486,45 @@ mod tests {
         }
 
         // Kill the server task
+        server_handle.abort();
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    // A custom-ALPN peer with keepalive reuse disabled always opens a fresh session,
+    // and the pooled session remains available for an unflagged acquisition.
+    #[tokio::test]
+    async fn test_custom_peer_disable_keepalive_reuse_skips_pool() {
+        let port = get_available_port().await;
+        let custom_protocol = b"custom".to_vec();
+
+        let listener =
+            build_custom_tls_listener(port, CustomALPN::new(custom_protocol.clone())).await;
+        let server_handle = spawn_test_tls_server(listener);
+        sleep(Duration::from_millis(100)).await;
+
+        let connector = create_test_connector();
+        let mut peer = create_peer_with_custom_proto(port, &custom_protocol);
+
+        let (custom, reused) = connector.get_http_session(&peer).await.unwrap();
+        assert!(!reused);
+        assert!(matches!(custom, HttpSession::Custom(_)));
+        connector.release_http_session(custom, &peer, None).await;
+
+        peer.options.disable_keepalive_reuse = true;
+        let (custom, reused) = connector.get_http_session(&peer).await.unwrap();
+        assert!(
+            !reused,
+            "flagged acquisition must not reuse a pooled session"
+        );
+        assert!(matches!(custom, HttpSession::Custom(_)));
+
+        peer.options.disable_keepalive_reuse = false;
+        let (_, reused) = connector.get_http_session(&peer).await.unwrap();
+        assert!(
+            reused,
+            "unflagged acquisition must reuse the pooled session"
+        );
+
         server_handle.abort();
         sleep(Duration::from_millis(100)).await;
     }
