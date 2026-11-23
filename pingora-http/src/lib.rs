@@ -43,7 +43,7 @@ use authority::{raw_target_authority, RawTargetAuthority};
 
 mod case_header_name;
 use case_header_name::CaseHeaderName;
-pub use case_header_name::IntoCaseHeaderName;
+pub use case_header_name::{HeaderNameConstant, IntoCaseHeaderName};
 
 pub mod prelude {
     pub use crate::RequestHeader;
@@ -852,11 +852,15 @@ fn append_header_value<T>(
     name: impl IntoCaseHeaderName,
     value: T,
 ) -> Result<bool> {
+    let parsed = name.parsed_header_name();
     let case_header_name = name.into_case_header_name();
-    let header_name: HeaderName = case_header_name
-        .as_slice()
-        .try_into()
-        .or_err(InvalidHTTPHeader, "invalid header name")?;
+    let header_name = match parsed {
+        Some(name) => name,
+        None => case_header_name
+            .as_slice()
+            .try_into()
+            .or_err(InvalidHTTPHeader, "invalid header name")?,
+    };
     // store the original case in the map
     if let Some(name_map) = name_map {
         // Use the non-panicking `try_append`: the infallible `append` calls
@@ -881,11 +885,15 @@ fn insert_header_value<T>(
     name: impl IntoCaseHeaderName,
     value: T,
 ) -> Result<()> {
+    let parsed = name.parsed_header_name();
     let case_header_name = name.into_case_header_name();
-    let header_name: HeaderName = case_header_name
-        .as_slice()
-        .try_into()
-        .or_err(InvalidHTTPHeader, "invalid header name")?;
+    let header_name = match parsed {
+        Some(name) => name,
+        None => case_header_name
+            .as_slice()
+            .try_into()
+            .or_err(InvalidHTTPHeader, "invalid header name")?,
+    };
     if let Some(name_map) = name_map {
         // store the original case in the map
         name_map.insert(header_name.clone(), case_header_name);
