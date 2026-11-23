@@ -21,6 +21,7 @@ use pingora_error::{
 };
 use std::fmt::Debug;
 use std::future::Future;
+use std::io::IoSlice;
 use std::pin::{pin, Pin};
 use std::task::{ready, Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -1261,6 +1262,29 @@ impl SendBodyState {
     }
 }
 
+async fn write_all_vectored<S>(
+    stream: &mut S,
+    mut slices: &mut [IoSlice<'_>],
+) -> std::io::Result<()>
+where
+    S: AsyncWrite + Unpin + Send,
+{
+    let total: usize = slices.iter().map(|s| s.len()).sum();
+    let mut written = 0;
+    while written < total {
+        let n = stream.write_vectored(slices).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "vectored body write returned 0",
+            ));
+        }
+        written += n;
+        IoSlice::advance_slices(&mut slices, n);
+    }
+    Ok(())
+}
+
 /// Tracks how response body bytes are framed and written to the wire.
 ///
 /// Supports both a legacy async API (`write_body` / `finish`) and a cancel-safe
@@ -1332,6 +1356,35 @@ impl BodyWriter {
         }
     }
 
+    /// Write a batch of body chunks, framing the whole batch once for the
+    /// current mode. Returns the body bytes written (not framing bytes).
+    pub async fn write_body_vec<S>(
+        &mut self,
+        stream: &mut S,
+        bufs: &[Bytes],
+    ) -> Result<Option<usize>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        if bufs.iter().all(Bytes::is_empty) {
+            return Ok(None);
+        }
+        match self.body_mode {
+            BM::Complete(_) => Ok(None),
+            BM::ContentLength(total, written) => {
+                self.do_write_body_vec(stream, bufs, total, written).await
+            }
+            BM::ChunkedEncoding(written) => {
+                self.do_write_chunked_body_vec(stream, bufs, written).await
+            }
+            BM::UntilClose(written) => {
+                self.do_write_until_close_body_vec(stream, bufs, written)
+                    .await
+            }
+            BM::ToSelect => Ok(None),
+        }
+    }
+
     pub fn finished(&self) -> bool {
         match self.body_mode {
             BM::Complete(_) => true,
@@ -1374,6 +1427,93 @@ impl BodyWriter {
             }
             _ => panic!("wrong body mode: {:?}", self.body_mode),
         }
+    }
+
+    async fn do_write_body_vec<S>(
+        &mut self,
+        stream: &mut S,
+        bufs: &[Bytes],
+        total: usize,
+        written: usize,
+    ) -> Result<Option<usize>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        if written >= total {
+            return Ok(None);
+        }
+        let remaining = total - written;
+        let batch_len: usize = bufs.iter().map(Bytes::len).sum();
+        if batch_len > remaining {
+            warn!("Trying to write data over content-length: {total}");
+        }
+        let mut slices = Vec::with_capacity(bufs.len());
+        let mut left = remaining;
+        for buf in bufs {
+            if left == 0 {
+                break;
+            }
+            let take = buf.len().min(left);
+            let Some(prefix) = buf.get(..take) else {
+                return Error::e_explain(
+                    WriteError,
+                    "body batch slice shorter than its bounded prefix",
+                );
+            };
+            slices.push(IoSlice::new(prefix));
+            left -= take;
+        }
+        write_all_vectored(stream, &mut slices)
+            .await
+            .or_err(WriteError, "while writing body")?;
+        let to_write = batch_len.min(remaining);
+        self.body_mode = BM::ContentLength(total, written + to_write);
+        if self.finished() {
+            stream.flush().await.or_err(WriteError, "flushing body")?;
+        }
+        Ok(Some(to_write))
+    }
+
+    async fn do_write_chunked_body_vec<S>(
+        &mut self,
+        stream: &mut S,
+        bufs: &[Bytes],
+        written: usize,
+    ) -> Result<Option<usize>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        let chunk_size: usize = bufs.iter().map(Bytes::len).sum();
+        let head = format!("{chunk_size:X}\r\n");
+        let mut slices = Vec::with_capacity(bufs.len() + 2);
+        slices.push(IoSlice::new(head.as_bytes()));
+        slices.extend(bufs.iter().map(|buf| IoSlice::new(buf)));
+        slices.push(IoSlice::new(b"\r\n"));
+        write_all_vectored(stream, &mut slices)
+            .await
+            .or_err(WriteError, "while writing body")?;
+        stream.flush().await.or_err(WriteError, "flushing body")?;
+        self.body_mode = BM::ChunkedEncoding(written + chunk_size);
+        Ok(Some(chunk_size))
+    }
+
+    async fn do_write_until_close_body_vec<S>(
+        &mut self,
+        stream: &mut S,
+        bufs: &[Bytes],
+        written: usize,
+    ) -> Result<Option<usize>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        let total: usize = bufs.iter().map(Bytes::len).sum();
+        let mut slices: Vec<IoSlice<'_>> = bufs.iter().map(|buf| IoSlice::new(buf)).collect();
+        write_all_vectored(stream, &mut slices)
+            .await
+            .or_err(WriteError, "while writing body")?;
+        stream.flush().await.or_err(WriteError, "flushing body")?;
+        self.body_mode = BM::UntilClose(written + total);
+        Ok(Some(total))
     }
 
     async fn do_write_chunked_body<S>(
@@ -3265,6 +3405,189 @@ mod tests {
         let res = body_writer.finish(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, 1);
         assert_eq!(body_writer.body_mode, BodyMode::Complete(1));
+    }
+
+    struct VectoredMock {
+        limit: Option<usize>,
+        calls: Vec<(usize, usize)>,
+        bytes: Vec<u8>,
+    }
+
+    impl VectoredMock {
+        fn new(limit: Option<usize>) -> Self {
+            Self {
+                limit,
+                calls: Vec::new(),
+                bytes: Vec::new(),
+            }
+        }
+    }
+
+    impl AsyncWrite for VectoredMock {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let n = buf.len().min(this.limit.unwrap_or(usize::MAX));
+            this.bytes.extend_from_slice(&buf[..n]);
+            this.calls.push((1, n));
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let slices = bufs.iter().filter(|b| !b.is_empty()).count();
+            let cap = this.limit.unwrap_or(usize::MAX);
+            let mut written = 0;
+            for buf in bufs {
+                if written == cap {
+                    break;
+                }
+                let take = buf.len().min(cap - written);
+                this.bytes.extend_from_slice(&buf[..take]);
+                written += take;
+            }
+            this.calls.push((slices, written));
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_body_vec_uses_one_vectored_write_and_completes_partial_writes_in_order() {
+        init_log();
+        let batch = [
+            Bytes::from_static(b"aaa"),
+            Bytes::from_static(b"bbb"),
+            Bytes::from_static(b"ccc"),
+        ];
+
+        let mut whole = VectoredMock::new(None);
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(9);
+        let written = body_writer
+            .write_body_vec(&mut whole, &batch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(written, 9);
+        assert_eq!(whole.calls, vec![(3, 9)], "one vectored write of 3 slices");
+        assert_eq!(whole.bytes, b"aaabbbccc");
+
+        let mut partial = VectoredMock::new(Some(2));
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(9);
+        let written = body_writer
+            .write_body_vec(&mut partial, &batch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(written, 9);
+        assert!(partial.calls.len() > 1, "a partial write is resumed");
+        assert_eq!(partial.bytes, b"aaabbbccc", "bytes complete in order");
+    }
+
+    #[tokio::test]
+    async fn write_body_vec_all_empty_chunks_in_chunked_mode_writes_nothing() {
+        init_log();
+        let mut chunked = VectoredMock::new(None);
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_chunked();
+
+        let written = body_writer
+            .write_body_vec(&mut chunked, &[Bytes::new()])
+            .await
+            .unwrap();
+
+        assert_eq!(written, None, "no body bytes were written");
+        assert!(
+            chunked.calls.is_empty(),
+            "no chunk frame including a terminator"
+        );
+        assert_eq!(body_writer.body_mode, BodyMode::ChunkedEncoding(0));
+    }
+
+    #[tokio::test]
+    async fn write_body_vec_all_empty_batches_write_nothing_in_content_length_and_until_close() {
+        init_log();
+        let batch = [Bytes::new(), Bytes::new()];
+
+        let mut cl = VectoredMock::new(None);
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(3);
+        let written = body_writer.write_body_vec(&mut cl, &batch).await.unwrap();
+        assert_eq!(written, None, "no body bytes were written");
+        assert!(cl.calls.is_empty(), "no write at all");
+        assert_eq!(body_writer.body_mode, BodyMode::ContentLength(3, 0));
+
+        let mut close = VectoredMock::new(None);
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_close_delimited();
+        let written = body_writer
+            .write_body_vec(&mut close, &batch)
+            .await
+            .unwrap();
+        assert_eq!(written, None, "no body bytes were written");
+        assert!(close.calls.is_empty(), "no write at all");
+        assert_eq!(body_writer.body_mode, BodyMode::UntilClose(0));
+
+        let mut cl = VectoredMock::new(None);
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(3);
+        let written = body_writer
+            .write_body_vec(&mut cl, &[Bytes::new(), Bytes::from_static(b"abc")])
+            .await
+            .unwrap();
+        assert_eq!(written, Some(3), "a batch with body bytes still writes");
+        assert_eq!(cl.bytes, b"abc");
+    }
+
+    #[tokio::test]
+    async fn write_body_vec_frames_chunked_and_until_close_batches_from_the_variant_state() {
+        init_log();
+        let batch = [Bytes::from_static(b"aaa"), Bytes::from_static(b"bbb")];
+
+        let mut chunked = VectoredMock::new(None);
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_chunked();
+        for expected_written in [6, 12] {
+            let written = body_writer
+                .write_body_vec(&mut chunked, &batch)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(written, 6);
+            assert_eq!(
+                body_writer.body_mode,
+                BodyMode::ChunkedEncoding(expected_written)
+            );
+        }
+        assert_eq!(chunked.bytes, b"6\r\naaabbb\r\n6\r\naaabbb\r\n");
+
+        let mut until_close = VectoredMock::new(Some(4));
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_close_delimited();
+        let written = body_writer
+            .write_body_vec(&mut until_close, &batch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(written, 6);
+        assert_eq!(until_close.bytes, b"aaabbb");
+        assert_eq!(body_writer.body_mode, BodyMode::UntilClose(6));
     }
 
     #[tokio::test]

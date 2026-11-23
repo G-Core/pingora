@@ -91,8 +91,6 @@ pub struct HttpSession {
     body_writer: BodyWriter,
     /// Cancel-safe proxy task state.
     proxy_task_state: ProxyTaskState,
-    /// An internal buffer to buf multiple body writes to reduce the underlying syscalls
-    body_write_buf: BytesMut,
     /// Track how many application (not on the wire) body bytes already sent
     body_bytes_sent: usize,
     /// Track how many application (not on the wire) body bytes already read
@@ -181,7 +179,6 @@ impl HttpSession {
             body_reader: BodyReader::new(false),
             body_writer: BodyWriter::new(),
             proxy_task_state: ProxyTaskState::default(),
-            body_write_buf: BytesMut::new(),
             keepalive_timeout: KeepaliveStatus::Off,
             update_resp_headers: true,
             response_written: None,
@@ -1040,34 +1037,27 @@ impl HttpSession {
         self.body_reader.take_body_overread()
     }
 
-    async fn do_write_body_buf(&mut self) -> Result<Option<usize>> {
-        // Don't flush empty chunks, they are considered end of body for chunks
-        if self.body_write_buf.is_empty() {
-            return Ok(None);
-        }
-
+    async fn do_write_body_batch(&mut self, bufs: &[Bytes]) -> Result<Option<usize>> {
         let written = self
             .body_writer
-            .write_body(&mut self.underlying_stream, &self.body_write_buf)
+            .write_body_vec(&mut self.underlying_stream, bufs)
             .await;
 
         if let Ok(Some(num_bytes)) = written {
             self.body_bytes_sent += num_bytes;
         }
 
-        // make sure this buf is safe to reuse
-        self.body_write_buf.clear();
-
         written
     }
 
-    async fn write_body_buf(&mut self) -> Result<Option<usize>> {
-        match self.write_timeout(self.body_write_buf.len()) {
-            Some(t) => match timeout(t, self.do_write_body_buf()).await {
+    async fn write_body_batch(&mut self, bufs: &[Bytes]) -> Result<Option<usize>> {
+        let len: usize = bufs.iter().map(Bytes::len).sum();
+        match self.write_timeout(len) {
+            Some(t) => match timeout(t, self.do_write_body_batch(bufs)).await {
                 Ok(res) => res,
                 Err(_) => Error::e_explain(WriteTimedout, format!("writing body, timeout: {t:?}")),
             },
-            None => self.do_write_body_buf().await,
+            None => self.do_write_body_batch(bufs).await,
         }
     }
 
@@ -1532,7 +1522,7 @@ impl HttpSession {
         Ok(end_stream || self.body_writer.finished())
     }
 
-    fn buffer_body_data(&mut self, data: Option<Bytes>, upgraded: bool) {
+    fn collect_body_data(&self, batch: &mut Vec<Bytes>, data: Option<Bytes>, upgraded: bool) {
         if upgraded != self.upgraded {
             if upgraded {
                 panic!("Unexpected Body task received on upgraded downstream session");
@@ -1545,11 +1535,10 @@ impl HttpSession {
             return;
         };
         if !d.is_empty() && !self.body_writer.finished() {
-            self.body_write_buf.put_slice(&d);
+            batch.push(d);
         }
     }
 
-    // TODO: use vectored write to avoid copying
     pub async fn response_duplex_vec(&mut self, mut tasks: Vec<HttpTask>) -> Result<bool> {
         let n_tasks = tasks.len();
         if n_tasks == 1 {
@@ -1558,6 +1547,7 @@ impl HttpSession {
         }
 
         let mut end_stream = false;
+        let mut body_batch: Vec<Bytes> = Vec::new();
         for task in tasks.into_iter() {
             end_stream = match task {
                 HttpTask::Header(header, end_stream) => {
@@ -1567,18 +1557,20 @@ impl HttpSession {
                     end_stream
                 }
                 HttpTask::Body(data, end_stream) => {
-                    self.buffer_body_data(data, false);
+                    self.collect_body_data(&mut body_batch, data, false);
                     end_stream
                 }
                 HttpTask::UpgradedBody(data, end_stream) => {
-                    self.buffer_body_data(data, true);
+                    self.collect_body_data(&mut body_batch, data, true);
                     end_stream
                 }
                 HttpTask::Trailer(_) => true, // h1 trailer is not supported yet
                 HttpTask::Done => true,
                 HttpTask::Failed(e) => {
                     // flush the data we have and quit
-                    self.write_body_buf().await.map_err(|e| e.into_down())?;
+                    self.write_body_batch(&body_batch)
+                        .await
+                        .map_err(|e| e.into_down())?;
                     self.underlying_stream
                         .flush()
                         .await
@@ -1587,7 +1579,9 @@ impl HttpSession {
                 }
             }
         }
-        self.write_body_buf().await.map_err(|e| e.into_down())?;
+        self.write_body_batch(&body_batch)
+            .await
+            .map_err(|e| e.into_down())?;
         if end_stream {
             // no-op if body wasn't initialized or is finished already
             self.finish_body().await.map_err(|e| e.into_down())?;
@@ -2990,6 +2984,134 @@ mod tests_stream {
     }
 
     #[tokio::test]
+    async fn response_duplex_vec_writes_header_then_the_content_length_batch() {
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
+        let wire_header = b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(read_wire)
+            .write(wire_header)
+            .write(b"aaabbbccc")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream.update_resp_headers = false;
+        let mut resp = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        resp.append_header("Content-Length", "9").unwrap();
+        let tasks = vec![
+            HttpTask::Header(Box::new(resp), false),
+            HttpTask::Body(Some(Bytes::from_static(b"aaa")), false),
+            HttpTask::Body(Some(Bytes::from_static(b"bbb")), false),
+            HttpTask::Body(Some(Bytes::from_static(b"ccc")), true),
+        ];
+
+        assert!(http_stream.response_duplex_vec(tasks).await.unwrap());
+        assert_eq!(http_stream.body_bytes_sent(), 9);
+    }
+
+    #[tokio::test]
+    async fn response_duplex_vec_frames_a_chunked_batch_once() {
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
+        let wire_header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(read_wire)
+            .write(wire_header)
+            .write(b"9\r\naaabbbccc\r\n")
+            .write(b"0\r\n\r\n")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream.update_resp_headers = false;
+        let mut resp = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        resp.append_header("Transfer-Encoding", "chunked").unwrap();
+        let tasks = vec![
+            HttpTask::Header(Box::new(resp), false),
+            HttpTask::Body(Some(Bytes::from_static(b"aaa")), false),
+            HttpTask::Body(Some(Bytes::from_static(b"bbb")), false),
+            HttpTask::Body(Some(Bytes::from_static(b"ccc")), true),
+        ];
+
+        assert!(http_stream.response_duplex_vec(tasks).await.unwrap());
+        assert_eq!(http_stream.body_bytes_sent(), 9);
+    }
+
+    #[tokio::test]
+    async fn response_duplex_vec_caps_a_batch_at_the_content_length() {
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
+        let wire_header = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(read_wire)
+            .write(wire_header)
+            .write(b"abcde")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream.update_resp_headers = false;
+        let mut resp = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        resp.append_header("Content-Length", "5").unwrap();
+        let tasks = vec![
+            HttpTask::Header(Box::new(resp), false),
+            HttpTask::Body(Some(Bytes::from_static(b"abc")), false),
+            HttpTask::Body(Some(Bytes::from_static(b"def")), true),
+        ];
+
+        assert!(http_stream.response_duplex_vec(tasks).await.unwrap());
+        assert_eq!(http_stream.body_bytes_sent(), 5);
+    }
+
+    #[tokio::test]
+    async fn response_duplex_vec_writes_an_upgraded_batch_unframed() {
+        let read_wire =
+            b"GET / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n";
+        let wire_header = b"HTTP/1.1 101 Switching Protocols\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(&read_wire[..])
+            .write(wire_header)
+            .write(b"payload")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream.update_resp_headers = false;
+        let resp = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
+        http_stream
+            .write_response_header(Box::new(resp))
+            .await
+            .unwrap();
+        let tasks = vec![
+            HttpTask::UpgradedBody(Some(Bytes::from_static(b"pay")), false),
+            HttpTask::UpgradedBody(Some(Bytes::from_static(b"load")), true),
+        ];
+
+        assert!(http_stream.response_duplex_vec(tasks).await.unwrap());
+        assert_eq!(http_stream.body_bytes_sent(), 7);
+    }
+
+    #[tokio::test]
+    async fn response_duplex_vec_flushes_the_batch_before_a_failed_task() {
+        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
+        let wire_header = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(read_wire)
+            .write(wire_header)
+            .write(b"aaabbb")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream.update_resp_headers = false;
+        let mut resp = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        resp.append_header("Content-Length", "6").unwrap();
+        let tasks = vec![
+            HttpTask::Header(Box::new(resp), false),
+            HttpTask::Body(Some(Bytes::from_static(b"aaa")), false),
+            HttpTask::Body(Some(Bytes::from_static(b"bbb")), false),
+            HttpTask::Failed(Error::new(ErrorType::WriteError)),
+        ];
+
+        let err = http_stream.response_duplex_vec(tasks).await.unwrap_err();
+        assert_eq!(err.etype(), &ErrorType::WriteError);
+        assert_eq!(http_stream.body_bytes_sent(), 6);
+    }
+
+    #[tokio::test]
     async fn test_write_body_buf() {
         let read_wire = b"GET / HTTP/1.1\r\n\r\n";
         let write_expected = b"HTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
@@ -3003,7 +3125,7 @@ mod tests_stream {
             .write_response_header_ref(&new_response)
             .await
             .unwrap();
-        let written = http_stream.write_body_buf().await.unwrap();
+        let written = http_stream.write_body_batch(&[]).await.unwrap();
         assert!(written.is_none());
     }
 
@@ -3029,8 +3151,9 @@ mod tests_stream {
             .write_response_header_ref(&new_response)
             .await
             .unwrap();
-        http_stream.body_write_buf = BytesMut::from(&b"abc"[..]);
-        let res = http_stream.write_body_buf().await;
+        let res = http_stream
+            .write_body_batch(&[Bytes::from_static(b"abc")])
+            .await;
         assert_eq!(res.unwrap_err().etype(), &WriteTimedout);
     }
 
