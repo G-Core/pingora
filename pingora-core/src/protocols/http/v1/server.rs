@@ -845,11 +845,10 @@ impl HttpSession {
             /* update headers */
             header.insert_header(header::DATE, date::get_cached_date())?;
 
-            // TODO: make these lazy static
             let connection_value = if self.will_keepalive() {
-                "keep-alive"
+                HeaderValue::from_static("keep-alive")
             } else {
-                "close"
+                HeaderValue::from_static("close")
             };
             header.insert_header(header::CONNECTION, connection_value)?;
         }

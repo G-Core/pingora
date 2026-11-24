@@ -18,7 +18,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use http::{header, header::AsHeaderName, HeaderValue, StatusCode, Version};
 use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OrErr, Result, RetryType};
-use pingora_http::{HMap, IntoCaseHeaderName, RequestHeader, ResponseHeader};
+use pingora_http::{HMap, HeaderNameConstant, IntoCaseHeaderName, RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use std::io::ErrorKind;
 use std::str;
@@ -623,7 +623,8 @@ impl HttpSession {
     /// it's behavior is different on different platforms.
     /// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Keep-Alive
     fn get_keepalive_values(&self) -> (Option<u64>, Option<usize>) {
-        let Some(keep_alive_header) = self.get_header("Keep-Alive") else {
+        static KEEP_ALIVE: HeaderNameConstant = HeaderNameConstant::new("Keep-Alive", "keep-alive");
+        let Some(keep_alive_header) = self.get_header(KEEP_ALIVE.name()) else {
             return (None, None);
         };
 
