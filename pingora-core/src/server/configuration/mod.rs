@@ -425,6 +425,7 @@ impl ServerConf {
                 poll_time_histogram_buckets: self.runtime_metrics_poll_time_histogram_buckets,
             },
             enable_alt_timer: self.runtime_enable_alt_timer,
+            worker_start: None,
             #[cfg(feature = "dial9")]
             dial9: None,
         }

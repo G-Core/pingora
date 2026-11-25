@@ -26,6 +26,7 @@
 use once_cell::sync::{Lazy, OnceCell};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 #[cfg(feature = "dial9")]
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -74,8 +75,11 @@ pub struct RuntimeMetricsOpts {
     pub poll_time_histogram_buckets: Option<usize>,
 }
 
+/// Callback run on a [`NoStealRuntime`] worker thread before it runs tasks, with that worker's index.
+pub type WorkerStartHook = Arc<dyn Fn(usize) + Send + Sync>;
+
 /// Configuration options for a Tokio runtime.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct RuntimeOpts {
     /// Options for runtime metrics collection.
     pub metrics: RuntimeMetricsOpts,
@@ -84,9 +88,32 @@ pub struct RuntimeOpts {
     /// This requires building with `--cfg tokio_unstable` and only applies to
     /// Tokio's multi-threaded runtime.
     pub enable_alt_timer: bool,
+    /// Hook run once on each worker thread before it runs tasks.
+    ///
+    /// Only [`NoStealRuntime`] invokes it, where the index is the worker's stable
+    /// thread index — the one its per-thread listener uses. A work-stealing
+    /// runtime ignores it: tokio does not expose a worker discriminator and does
+    /// not guarantee a start order.
+    pub worker_start: Option<WorkerStartHook>,
     /// Options for dial9 Tokio telemetry.
     #[cfg(feature = "dial9")]
     pub dial9: Option<Dial9RuntimeOpts>,
+}
+
+impl fmt::Debug for RuntimeOpts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_struct("RuntimeOpts");
+        debug
+            .field("metrics", &self.metrics)
+            .field("enable_alt_timer", &self.enable_alt_timer)
+            .field(
+                "worker_start",
+                &self.worker_start.as_ref().map(|_| "callback"),
+            );
+        #[cfg(feature = "dial9")]
+        debug.field("dial9", &self.dial9);
+        debug.finish()
+    }
 }
 
 /// Configuration options for dial9 Tokio telemetry.
@@ -479,6 +506,9 @@ impl RuntimeBuilder {
     /// Build the [`Runtime`].
     pub fn build(self) -> Runtime {
         if self.work_steal {
+            if self.runtime_opts.worker_start.is_some() {
+                log::warn!("worker_start hook is ignored when work stealing is enabled");
+            }
             let mut builder = self.build_work_stealing_tokio_builder();
             #[cfg(feature = "dial9")]
             let dial9_guard = if let Some(dial9_opts) = &self.runtime_opts.dial9 {
@@ -650,7 +680,7 @@ impl NoStealRuntime {
     fn init_pools(&self) -> (Box<[Handle]>, Vec<Control>) {
         let mut pools = Vec::with_capacity(self.threads);
         let mut controls = Vec::with_capacity(self.threads);
-        for _ in 0..self.threads {
+        for index in 0..self.threads {
             let mut builder = Builder::new_current_thread();
             builder.enable_all();
             apply_blocking_opts(&mut builder, &self.blocking_opts);
@@ -661,10 +691,14 @@ impl NoStealRuntime {
             let handler = rt.handle().clone();
             let (tx, rx) = channel::<Duration>();
             let pools_ref = self.pools.clone();
+            let hook = self.runtime_opts.worker_start.clone();
             let join = std::thread::Builder::new()
                 .name(self.name.clone())
                 .spawn(move || {
                     CURRENT_HANDLE.get_or(|| pools_ref);
+                    if let Some(hook) = hook {
+                        hook(index);
+                    }
                     if let Ok(timeout) = rt.block_on(rx) {
                         rt.shutdown_timeout(timeout);
                     } // else Err(_): tx is dropped, just exit
@@ -807,4 +841,114 @@ fn test_dial9_zero_worker_poll_interval_is_rejected() {
         err.to_string(),
         "dial9 worker_poll_interval must be greater than zero"
     );
+}
+
+#[cfg(test)]
+mod worker_start_hook {
+    use super::*;
+    use std::cell::Cell;
+    use std::collections::HashSet;
+    use std::sync::{mpsc, Mutex};
+    use std::thread::ThreadId;
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static RECORDED_INDEX: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    type Records = Arc<Mutex<Vec<(usize, ThreadId)>>>;
+
+    fn runtime_opts(records: &Records) -> RuntimeOpts {
+        let records = records.clone();
+        RuntimeOpts {
+            worker_start: Some(Arc::new(move |index| {
+                RECORDED_INDEX.set(Some(index));
+                records
+                    .lock()
+                    .expect("record lock")
+                    .push((index, std::thread::current().id()));
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn wait_for(records: &Records, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while records.lock().expect("record lock").len() < count {
+            assert!(
+                Instant::now() < deadline,
+                "hook ran fewer than {count} times"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn assert_one_per_index(records: &Records, threads: usize) {
+        let recorded = records.lock().expect("record lock").clone();
+        assert_eq!(recorded.len(), threads);
+        let mut indexes: Vec<_> = recorded.iter().map(|(index, _)| *index).collect();
+        indexes.sort_unstable();
+        assert_eq!(indexes, (0..threads).collect::<Vec<_>>());
+        let ids: HashSet<_> = recorded.iter().map(|(_, id)| *id).collect();
+        assert_eq!(ids.len(), threads, "indexes were not on distinct threads");
+        assert!(!ids.contains(&std::thread::current().id()));
+    }
+
+    #[test]
+    fn runs_once_per_no_steal_thread_with_its_index() {
+        const THREADS: usize = 4;
+        let records: Records = Arc::new(Mutex::new(Vec::new()));
+        let runtime = NoStealRuntime::new(
+            THREADS,
+            "hook-nosteal",
+            BlockingPoolOpts::default(),
+            runtime_opts(&records),
+        );
+
+        // First handle use spawns the pools (and so runs the hook).
+        runtime.get_runtime_at(0);
+        wait_for(&records, THREADS);
+        assert_one_per_index(&records, THREADS);
+
+        // A task on thread `i` runs after the hook on that thread and sees its index.
+        for index in 0..THREADS {
+            let (tx, rx) = mpsc::channel();
+            runtime
+                .get_runtime_at(index)
+                .spawn(async move { tx.send(RECORDED_INDEX.get()) });
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(10)).expect("task ran"),
+                Some(index)
+            );
+        }
+
+        runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn work_stealing_runtime_does_not_invoke_the_hook() {
+        const THREADS: usize = 4;
+        let records: Records = Arc::new(Mutex::new(Vec::new()));
+        let runtime = RuntimeBuilder::new(THREADS, "hook-steal")
+            .runtime_opts(runtime_opts(&records))
+            .build();
+
+        runtime.get_handle().block_on(async {
+            let blocking: Vec<_> = (0..THREADS)
+                .map(|_| tokio::task::spawn_blocking(|| {}))
+                .collect();
+            for task in blocking {
+                task.await.expect("blocking task");
+            }
+            let tasks: Vec<_> = (0..64)
+                .map(|_| tokio::spawn(async { tokio::task::yield_now().await }))
+                .collect();
+            for task in tasks {
+                task.await.expect("task");
+            }
+        });
+
+        assert!(records.lock().expect("record lock").is_empty());
+        runtime.shutdown_timeout(Duration::from_secs(1));
+    }
 }

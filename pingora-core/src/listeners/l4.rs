@@ -91,10 +91,13 @@ impl ServerAddress {
     }
 }
 
+/// Maps a runtime worker thread index to the CPU assigned to its listening socket.
+pub type IncomingCpuAssignment = Arc<dyn Fn(usize) -> Option<i32> + Send + Sync>;
+
 /// TCP socket configuration options, this is used for setting options on
 /// listening sockets and accepted connections.
 #[non_exhaustive]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct TcpSocketOptions {
     /// IPV6_V6ONLY flag (if true, limit socket to IPv6 communication only).
     /// This is mostly useful when binding to `[::]`, which on most Unix distributions
@@ -119,7 +122,31 @@ pub struct TcpSocketOptions {
     /// Set the receive buffer size for accepted connections. See
     /// [SO_RCVBUF](https://man7.org/linux/man-pages/man7/socket.7.html).
     pub tcp_recv_buf: Option<usize>,
+    /// Assign the per-thread listening sockets a CPU with `SO_INCOMING_CPU`.
+    ///
+    /// Only the `NoSteal` per-thread listener path uses this: it calls the
+    /// assignment with the thread index and applies the returned CPU to that
+    /// thread's freshly bound or inherited socket.
+    pub incoming_cpu: Option<IncomingCpuAssignment>,
     // TODO: allow configuring reuseaddr, backlog, etc. from here?
+}
+
+impl std::fmt::Debug for TcpSocketOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TcpSocketOptions")
+            .field("ipv6_only", &self.ipv6_only)
+            .field("tcp_fastopen", &self.tcp_fastopen)
+            .field("tcp_keepalive", &self.tcp_keepalive)
+            .field("dscp", &self.dscp)
+            .field("so_reuseport", &self.so_reuseport)
+            .field("tcp_snd_buf", &self.tcp_snd_buf)
+            .field("tcp_recv_buf", &self.tcp_recv_buf)
+            .field(
+                "incoming_cpu",
+                &self.incoming_cpu.as_ref().map(|_| "assignment"),
+            )
+            .finish()
+    }
 }
 
 #[cfg(unix)]
@@ -213,6 +240,27 @@ fn apply_tcp_socket_options(sock: &TcpSocket, opt: Option<&TcpSocketOptions>) ->
         set_dscp(raw, dscp)?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_incoming_cpu(fd: std::os::unix::io::RawFd, cpu: i32) -> Result<()> {
+    let value = cpu as libc::c_int;
+    // SAFETY: `fd` is an open socket owned by the caller. `setsockopt` only reads the
+    // four bytes of `value`, which outlives the call.
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_INCOMING_CPU,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()).or_err(BindError, "failed to set SO_INCOMING_CPU")
+    }
 }
 
 fn from_raw_fd(address: &ServerAddress, fd: i32) -> Result<Listener> {
@@ -626,6 +674,20 @@ impl ListenerEndpointBuilder {
             // No fd table (e.g. tests or non-upgrade start).
             bind_tcp_reuseport(addr_str).await?
         };
+
+        #[cfg(target_os = "linux")]
+        if let Some(cpu) = listen_addr
+            .tcp_sock_opts()
+            .and_then(|opt| opt.incoming_cpu.as_ref())
+            .and_then(|assign| assign(thread_idx))
+        {
+            if let Err(e) = set_incoming_cpu(listener.as_raw_fd(), cpu) {
+                warn!(
+                    "failed to set SO_INCOMING_CPU={cpu} on {} for listener thread {thread_idx}: {e}",
+                    listen_addr.as_ref()
+                );
+            }
+        }
 
         #[cfg(feature = "connection_filter")]
         let connection_filter = self
@@ -1100,5 +1162,90 @@ mod test {
 
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn incoming_cpu(fd: std::os::unix::io::RawFd) -> i32 {
+        let mut cpu: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `fd` is an open socket and `getsockopt` writes at most `len` bytes.
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_INCOMING_CPU,
+                (&mut cpu as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(
+            ret,
+            0,
+            "getsockopt failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(len as usize, std::mem::size_of::<libc::c_int>());
+        cpu
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn per_thread_listener_sets_so_incoming_cpu() {
+        let options = TcpSocketOptions {
+            incoming_cpu: Some(Arc::new(|index: usize| Some(index as i32 + 3))),
+            ..Default::default()
+        };
+
+        for thread_idx in 0..3 {
+            let mut builder = ListenerEndpoint::builder();
+            builder.listen_addr(ServerAddress::Tcp(
+                "127.0.0.1:0".into(),
+                Some(options.clone()),
+            ));
+            let endpoint = builder.listen_for_thread(None, thread_idx).await.unwrap();
+
+            assert_eq!(
+                incoming_cpu(endpoint.listener.as_ref().as_raw_fd()),
+                thread_idx as i32 + 3
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn inherited_per_thread_listener_sets_so_incoming_cpu() {
+        use crate::server::Fds;
+        use parking_lot::Mutex as ParkingMutex;
+        use socket2::{Domain, Protocol, Socket, Type};
+
+        let options = TcpSocketOptions {
+            incoming_cpu: Some(Arc::new(|index: usize| Some(index as i32 + 7))),
+            ..Default::default()
+        };
+
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        socket.set_reuse_address(true).unwrap();
+        socket.set_reuse_port(true).unwrap();
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        socket.bind(&bind_addr.into()).unwrap();
+        socket.listen(128).unwrap();
+        let addr = socket
+            .local_addr()
+            .unwrap()
+            .as_socket()
+            .unwrap()
+            .to_string();
+        let fd = socket.as_raw_fd();
+        // The fd table takes ownership of the descriptor number.
+        std::mem::forget(socket);
+
+        let fds: ListenFds = Arc::new(ParkingMutex::new(Fds::new()));
+        fds.lock().deserialize(vec![format!("{addr}#0")], vec![fd]);
+
+        let mut builder = ListenerEndpoint::builder();
+        builder.listen_addr(ServerAddress::Tcp(addr, Some(options)));
+        let endpoint = builder.listen_for_thread(Some(fds), 0).await.unwrap();
+
+        assert_eq!(incoming_cpu(endpoint.listener.as_ref().as_raw_fd()), 7);
     }
 }

@@ -19,11 +19,8 @@ use log::{debug, warn};
 use parking_lot::Mutex;
 use pingora_timeout::{sleep, timeout};
 use std::collections::HashMap;
-use std::future::Future;
 use std::io;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{oneshot, watch, Notify, OwnedMutexGuard};
@@ -56,111 +53,72 @@ impl ConnectionMeta {
 struct PoolConnection<S> {
     pub notify_use: oneshot::Sender<bool>,
     pub connection: S,
-    // Resolves once the idle watcher has fully dropped its handle, so a reuse
-    // can take sole ownership of `connection` without racing the guard drop.
-    pub released: oneshot::Receiver<()>,
 }
 
 impl<S> PoolConnection<S> {
-    pub fn new(
-        notify_use: oneshot::Sender<bool>,
-        connection: S,
-        released: oneshot::Receiver<()>,
-    ) -> Self {
+    pub fn new(notify_use: oneshot::Sender<bool>, connection: S) -> Self {
         PoolConnection {
             notify_use,
             connection,
-            released,
         }
     }
 
-    pub fn release(self) -> (S, oneshot::Receiver<()>) {
+    pub fn release(self) -> S {
         // notify the idle watcher to release the connection
         let _ = self.notify_use.send(true);
-        (self.connection, self.released)
-    }
-}
-
-/// The idle watcher's handle to a released connection: the notification that the
-/// connection is being reused, plus the signal that lets the reuse take ownership.
-pub struct IdleWatch {
-    watch_use: oneshot::Receiver<bool>,
-    release: ReleaseToken,
-}
-
-struct ReleaseToken(Option<oneshot::Sender<()>>);
-
-impl ReleaseToken {
-    fn release(self) {
-        if let Some(sender) = self.0 {
-            let _ = sender.send(());
-        }
-    }
-}
-
-/// A pooled connection handed out only after its idle watcher has dropped its
-/// handle, so awaiting it yields the connection in sole ownership.
-pub struct PendingReuse<S> {
-    stream: Option<S>,
-    released: oneshot::Receiver<()>,
-}
-
-impl<S: Unpin> Future for PendingReuse<S> {
-    type Output = S;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<S> {
-        let this = self.get_mut();
-        match Pin::new(&mut this.released).poll(cx) {
-            Poll::Ready(_) => match this.stream.take() {
-                Some(stream) => Poll::Ready(stream),
-                // Polled after completion; the connection was already yielded.
-                None => Poll::Pending,
-            },
-            Poll::Pending => Poll::Pending,
-        }
+        // wait for the watcher to release
+        self.connection
     }
 }
 
 use crossbeam_queue::ArrayQueue;
 
-// Keep the queue size small because eviction is O(n) in the queue
-const HOT_QUEUE_SIZE: usize = 16;
-
-// One inserting thread's slice of a key's idle connections: the original
-// hot-queue-plus-overflow layout, with its own locks.
-struct PoolGroup<T> {
+/// A pool of exchangeable items
+pub struct PoolNode<T> {
     connections: Mutex<HashMap<ID, T>>,
     // a small lock free queue to avoid lock contention
     hot_queue: ArrayQueue<(ID, T)>,
     // to avoid race between 2 evictions on the queue
     hot_queue_remove_lock: Mutex<()>,
+    // TODO: store the GroupKey to avoid hash collision?
 }
 
-impl<T> PoolGroup<T> {
-    fn new() -> Self {
-        PoolGroup {
+// Keep the queue size small because eviction is O(n) in the queue
+const HOT_QUEUE_SIZE: usize = 16;
+
+impl<T> PoolNode<T> {
+    /// Create a new [PoolNode]
+    pub fn new() -> Self {
+        PoolNode {
             connections: Mutex::new(HashMap::new()),
             hot_queue: ArrayQueue::new(HOT_QUEUE_SIZE),
             hot_queue_remove_lock: Mutex::new(()),
         }
     }
 
-    fn get_any(&self) -> Option<(ID, T)> {
+    /// Get any item from the pool
+    pub fn get_any(&self) -> Option<(ID, T)> {
         let hot_conn = self.hot_queue.pop();
         if hot_conn.is_some() {
             return hot_conn;
         }
         let mut connections = self.connections.lock();
+        // find one connection, any connection will do
         let id = match connections.iter().next() {
             Some((k, _)) => *k, // OK to copy i32
             None => return None,
         };
         // unwrap is safe since we just found it
         let connection = connections.remove(&id).unwrap();
+        /* NOTE: we don't resize or drop empty connections hashmap
+         * We may want to do it if they consume too much memory
+         * maybe we should use trees to save memory */
         Some((id, connection))
+        // connections.lock released here
     }
 
-    fn insert(&self, id: ID, conn: T) {
+    /// Insert an item with the given unique ID into the pool
+    pub fn insert(&self, id: ID, conn: T) {
         if let Err(node) = self.hot_queue.push((id, conn)) {
             // hot queue is full
             let mut connections = self.connections.lock();
@@ -168,15 +126,30 @@ impl<T> PoolGroup<T> {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    /// Returns `true` if the pool node contains no connections in either the hot queue
+    /// or the overflow hash map.
+    ///
+    /// # Concurrency note
+    ///
+    /// This check is not atomic across the two internal stores (`hot_queue` and
+    /// `connections`). Between checking one and the other, a concurrent `insert` or
+    /// `get_any` could change the state. This is acceptable because callers use
+    /// `is_empty` only as a hint to attempt cleanup, and always re-verify under
+    /// an exclusive (write) lock before actually removing the node from the parent
+    /// pool HashMap. A false-negative simply defers cleanup to the next opportunity;
+    /// a false-positive is largely mitigated by the re-check (see
+    /// [`ConnectionPool::try_remove_empty_node`] for residual race-window analysis).
+    pub fn is_empty(&self) -> bool {
         // Check the lock-free queue first (cheap atomic load) to avoid acquiring
         // the mutex in the common case where connections are present.
         self.hot_queue.is_empty() && self.connections.lock().is_empty()
     }
 
     // This function acquires 2 locks and iterates over the entire hot queue.
-    // But it should be fine because remove() rarely happens on a busy PoolGroup.
-    fn remove(&self, id: ID) -> Option<T> {
+    // But it should be fine because remove() rarely happens on a busy PoolNode.
+    /// Remove the item associated with the id from the pool. The item is returned
+    /// if it is found and removed.
+    pub fn remove(&self, id: ID) -> Option<T> {
         // check the table first as least recent used ones are likely there
         let removed = self.connections.lock().remove(&id);
         if removed.is_some() {
@@ -202,68 +175,6 @@ impl<T> PoolGroup<T> {
         }
         None
         // _queue_lock drops here
-    }
-}
-
-/// A pool of exchangeable items.
-///
-/// Idle connections are grouped by the thread that inserted them. A `get` on
-/// the inserting thread is served from its own group's lock-free queue without
-/// touching another thread's group; `get_any` falls back to any other group,
-/// and `remove`/`is_empty` cover every group.
-pub struct PoolNode<T> {
-    groups: DashMap<std::thread::ThreadId, Arc<PoolGroup<T>>>,
-}
-
-impl<T> PoolNode<T> {
-    /// Create a new [PoolNode]
-    pub fn new() -> Self {
-        PoolNode {
-            groups: DashMap::new(),
-        }
-    }
-
-    /// Get any item from the pool, preferring one inserted by the calling thread
-    pub fn get_any(&self) -> Option<(ID, T)> {
-        let caller = std::thread::current().id();
-        if let Some(group) = self.groups.get(&caller) {
-            if let Some(conn) = group.get_any() {
-                return Some(conn);
-            }
-        }
-        self.groups.iter().find_map(|group| group.value().get_any())
-    }
-
-    /// Insert an item into the calling thread's group
-    pub fn insert(&self, id: ID, conn: T) {
-        let caller = std::thread::current().id();
-        self.groups
-            .entry(caller)
-            .or_insert_with(|| Arc::new(PoolGroup::new()))
-            .insert(id, conn);
-    }
-
-    /// Returns `true` if every per-thread group is empty.
-    ///
-    /// # Concurrency note
-    ///
-    /// This check is not atomic across groups. Between checking one and the next, a
-    /// concurrent `insert` or `get_any` could change the state. This is acceptable
-    /// because callers use `is_empty` only as a hint to attempt cleanup, and always
-    /// re-verify under an exclusive (write) lock before actually removing the node
-    /// from the parent pool HashMap. A false-negative simply defers cleanup to the
-    /// next opportunity; a false-positive is largely mitigated by the re-check (see
-    /// [`ConnectionPool::try_remove_empty_node`] for residual race-window analysis).
-    pub fn is_empty(&self) -> bool {
-        self.groups.iter().all(|group| group.value().is_empty())
-    }
-
-    /// Remove the item associated with the id from any group. The item is returned
-    /// if it is found and removed.
-    pub fn remove(&self, id: ID) -> Option<T> {
-        self.groups
-            .iter()
-            .find_map(|group| group.value().remove(id))
     }
 }
 
@@ -361,22 +272,6 @@ impl<S> ConnectionPool<S> {
 
     /// Get a connection from this pool under the same group key
     pub fn get(&self, key: &GroupKey) -> Option<S> {
-        self.take_connection(key)
-            .map(|(connection, _released)| connection)
-    }
-
-    /// Get a connection that is handed out only once its idle watcher has
-    /// dropped its handle: the returned [`PendingReuse`] yields it in sole
-    /// ownership.
-    pub fn get_with_release(&self, key: &GroupKey) -> Option<PendingReuse<S>> {
-        self.take_connection(key)
-            .map(|(stream, released)| PendingReuse {
-                stream: Some(stream),
-                released,
-            })
-    }
-
-    fn take_connection(&self, key: &GroupKey) -> Option<(S, oneshot::Receiver<()>)> {
         let pool_node = self.pools.get(key)?.value().clone();
 
         if let Some((id, connection)) = pool_node.get_any() {
@@ -401,25 +296,20 @@ impl<S> ConnectionPool<S> {
     /// Release a connection to this pool for reuse
     ///
     /// - The returned [`Arc<Notify>`] will notify any listener when the connection is evicted from the pool.
-    /// - The returned [`IdleWatch`] reports when the connection is picked up, and
-    ///   signals a [`Self::get_with_release`] waiter once the watcher has dropped
-    ///   its handle.
-    pub fn put(&self, meta: &ConnectionMeta, connection: S) -> (Arc<Notify>, IdleWatch) {
+    /// - The returned [`oneshot::Receiver<bool>`] will notify when the connection is being picked up by [Self::get()].
+    pub fn put(
+        &self,
+        meta: &ConnectionMeta,
+        connection: S,
+    ) -> (Arc<Notify>, oneshot::Receiver<bool>) {
         let (notify_close, evicted) = self.lru.add(meta.id, meta.clone());
         for meta in &evicted {
             self.pop_evicted(meta);
         }
         let (notify_use, watch_use) = oneshot::channel();
-        let (released_tx, released_rx) = oneshot::channel();
-        let connection = PoolConnection::new(notify_use, connection, released_rx);
+        let connection = PoolConnection::new(notify_use, connection);
         self.insert_pool_connection(meta.key, meta.id, connection);
-        (
-            notify_close,
-            IdleWatch {
-                watch_use,
-                release: ReleaseToken(Some(released_tx)),
-            },
-        )
+        (notify_close, watch_use)
     }
 
     /// Actively monitor the health of a connection that is already released to this pool
@@ -431,27 +321,6 @@ impl<S> ConnectionPool<S> {
     ///
     /// Returns `true` if the connection was evicted from the pool, and `false` otherwise.
     pub async fn idle_poll<Stream>(
-        &self,
-        connection: OwnedMutexGuard<Stream>,
-        meta: &ConnectionMeta,
-        timeout: Option<Duration>,
-        notify_evicted: Arc<Notify>,
-        watch: IdleWatch,
-    ) -> bool
-    where
-        Stream: AsyncRead + Unpin + Send,
-    {
-        let IdleWatch { watch_use, release } = watch;
-        // The guard is dropped when `poll_idle` returns, so the release reaches a
-        // `PendingReuse` waiter only after sole ownership is available.
-        let result = self
-            .poll_idle(connection, meta, timeout, notify_evicted, watch_use)
-            .await;
-        release.release();
-        result
-    }
-
-    async fn poll_idle<Stream>(
         &self,
         connection: OwnedMutexGuard<Stream>,
         meta: &ConnectionMeta,
@@ -518,22 +387,6 @@ impl<S> ConnectionPool<S> {
     ///
     /// Returns `true` if the connection was evicted from the pool, and `false` otherwise.
     pub async fn idle_timeout(
-        &self,
-        meta: &ConnectionMeta,
-        timeout: Option<Duration>,
-        notify_evicted: Arc<Notify>,
-        notify_closed: watch::Receiver<bool>,
-        watch: IdleWatch,
-    ) -> bool {
-        let IdleWatch { watch_use, release } = watch;
-        let result = self
-            .time_out_idle(meta, timeout, notify_evicted, notify_closed, watch_use)
-            .await;
-        release.release();
-        result
-    }
-
-    async fn time_out_idle(
         &self,
         meta: &ConnectionMeta,
         timeout: Option<Duration>,
@@ -1343,88 +1196,5 @@ mod tests {
             0,
             "node should be cleaned up again after get"
         );
-    }
-
-    // Story 1: insertion order across threads does not matter — the inserting
-    // thread gets its own connection back while the other thread's stays idle.
-    #[test]
-    fn pooled_node_returns_the_calling_thread_its_own_connection() {
-        use std::sync::Barrier;
-
-        let node = Arc::new(PoolNode::new());
-        let other_inserted = Arc::new(Barrier::new(2));
-
-        let other = {
-            let node = node.clone();
-            let other_inserted = other_inserted.clone();
-            std::thread::spawn(move || {
-                node.insert(2, "other");
-                other_inserted.wait();
-            })
-        };
-        // The other thread inserts first.
-        other_inserted.wait();
-
-        node.insert(1, "own");
-        assert_eq!(
-            node.get_any().map(|(id, _)| id),
-            Some(1),
-            "the inserting thread must get its own connection"
-        );
-        assert_eq!(
-            node.get_any().map(|(id, _)| id),
-            Some(2),
-            "the other thread's idle connection must still be reachable"
-        );
-        other.join().unwrap();
-    }
-
-    // Story 2: a thread that inserted nothing borrows another thread's connection.
-    #[test]
-    fn pooled_node_falls_back_to_another_threads_connection() {
-        let node = Arc::new(PoolNode::new());
-        let other = {
-            let node = node.clone();
-            std::thread::spawn(move || node.insert(7, "other"))
-        };
-        other.join().unwrap();
-
-        assert_eq!(
-            node.get_any().map(|(id, _)| id),
-            Some(7),
-            "a non-inserting thread must borrow another thread's connection"
-        );
-    }
-
-    // Story 3: remove/is_empty work across groups, and overflow connections
-    // (beyond one thread's hot capacity) stay reachable from another thread.
-    #[test]
-    fn pooled_node_remove_and_empty_cover_every_thread_group() {
-        const INSERTED: ID = 24;
-        let node = Arc::new(PoolNode::new());
-        let other = {
-            let node = node.clone();
-            std::thread::spawn(move || {
-                for id in 0..INSERTED {
-                    node.insert(id, id);
-                }
-            })
-        };
-        other.join().unwrap();
-
-        assert!(!node.is_empty());
-        assert_eq!(node.remove(3), Some(3), "remove must reach the other group");
-        assert_eq!(node.remove(3), None, "removed id must be gone");
-
-        let mut seen = std::collections::HashSet::new();
-        while let Some((id, _)) = node.get_any() {
-            seen.insert(id);
-        }
-        assert_eq!(
-            seen.len(),
-            INSERTED as usize - 1,
-            "every non-removed connection, including the overflow, must be reachable"
-        );
-        assert!(node.is_empty(), "is_empty must cover every group");
     }
 }
