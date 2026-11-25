@@ -342,7 +342,9 @@ impl TransportConnector {
         let idle_meta = IdleConnection::new(meta);
         let pool = self.connection_pool.clone(); //clone the arc
         let keepalive_pool_callback = self.keepalive_pool_callback.clone();
-        let rt = pingora_runtime::current_handle();
+        // Keep the idle watcher on the releasing thread: under a NoSteal runtime
+        // every worker is its own runtime, and `current_handle()` picks a random one.
+        let rt = tokio::runtime::Handle::current();
         rt.spawn(async move {
             if pool
                 .idle_poll(
@@ -921,6 +923,66 @@ mod tests {
             counter.load(Ordering::Relaxed),
             1,
             "unexpected_data_connection_count should have incremented"
+        );
+    }
+
+    #[test]
+    fn released_idle_watcher_runs_on_the_releasing_thread() {
+        use std::sync::Mutex as StdMutex;
+
+        const WORKERS: usize = 4;
+        const EVICTIONS: usize = 32;
+
+        let runtime = pingora_runtime::Runtime::new_no_steal(WORKERS, "test-idle-watcher");
+        let (done, wait) = std::sync::mpsc::channel();
+        runtime.get_handle().spawn(async move {
+            let releasing = std::thread::current().id();
+            let callback_threads = Arc::new(StdMutex::new(Vec::new()));
+            let recorded = callback_threads.clone();
+            let mut options = ConnectorOptions::new(1);
+            options.keepalive_pool_callback = Some(Arc::new(move |_elapsed| {
+                recorded
+                    .lock()
+                    .expect("callback threads")
+                    .push(std::thread::current().id());
+            }));
+            let connector = TransportConnector::new(Some(options));
+
+            // Keep the listener (and its backlog) alive so the released streams stay
+            // open and reusable; never accept, so no peer FIN arrives.
+            let _listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = _listener.local_addr().unwrap();
+            let peer = BasicPeer::new(&addr.to_string());
+
+            // A one-slot pool: every release after the first evicts its predecessor
+            // and fires that predecessor's callback.
+            for _ in 0..=EVICTIONS {
+                let stream = connector.new_stream(&peer).await.unwrap();
+                connector.release_stream(stream, peer.reuse_hash(), None);
+            }
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while callback_threads.lock().unwrap().len() < EVICTIONS
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let callbacks = callback_threads.lock().unwrap().clone();
+            let _ = done.send((releasing, callbacks));
+        });
+
+        let (releasing, callbacks) = wait
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the idle-watcher task did not finish");
+        runtime.shutdown_timeout(Duration::from_secs(1));
+        assert_eq!(
+            callbacks.len(),
+            EVICTIONS,
+            "every eviction must fire its keepalive callback"
+        );
+        assert!(
+            callbacks.iter().all(|thread| *thread == releasing),
+            "every idle watcher must run on the releasing thread: {callbacks:?} vs {releasing:?}"
         );
     }
 }
