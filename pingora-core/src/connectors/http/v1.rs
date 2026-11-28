@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::connectors::{ConnectorOptions, TransportConnector};
+use crate::connectors::{ConnectorOptions, PoolCounters, TransportConnector};
 use crate::protocols::http::v1::client::HttpSession;
 use crate::upstreams::peer::Peer;
 
@@ -72,6 +72,11 @@ impl Connector {
     /// Return a shared reference to the unexpected data connection counter for periodic metric reporting.
     pub fn unexpected_data_connection_counter(&self) -> Arc<AtomicU64> {
         self.transport.unexpected_data_connection_counter()
+    }
+
+    /// Replace the pool reuse counters with a shared instance.
+    pub fn set_pool_counters(&mut self, counters: Arc<PoolCounters>) {
+        self.transport.set_pool_counters(counters);
     }
 }
 

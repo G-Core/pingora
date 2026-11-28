@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::listeners::tls::Acceptor;
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::tls::TlsRef;
-use crate::protocols::{tls::SslDigest, Peek, TimingDigest, UniqueIDType};
+use crate::protocols::{tls::SslDigest, Peek, Rebind, TimingDigest, UniqueIDType};
 use crate::protocols::{
     GetProxyDigest, GetSocketDigest, GetTimingDigest, SocketDigest, Ssl, UniqueID, ALPN,
 };
@@ -49,6 +49,15 @@ pub struct TlsStream<T> {
     digest: Option<Arc<SslDigest>>,
     ssl: Option<TlsRef>,
     timing: TimingDigest,
+}
+
+impl<T: Rebind> TlsStream<T> {
+    pub(crate) fn rebind_inner(&mut self) -> std::io::Result<()> {
+        match self.tls.stream.as_mut() {
+            Some(stream) => stream.get_mut().0.rebind(),
+            None => Ok(()),
+        }
+    }
 }
 
 impl<T> TlsStream<T>

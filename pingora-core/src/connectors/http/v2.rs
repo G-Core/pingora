@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use super::HttpSession;
-use crate::connectors::{ConnectorOptions, IdleConnection, PoolCallback, TransportConnector};
+use crate::connectors::{
+    ConnectorOptions, IdleConnection, PoolCallback, PoolCounters, TransportConnector,
+};
 use crate::protocols::http::custom::client::Session;
 use crate::protocols::http::v1::client::HttpSession as Http1Session;
 use crate::protocols::http::v2::client::{drive_connection, Http2Session};
@@ -329,6 +331,11 @@ impl Connector {
 
     pub fn transport(&self) -> &TransportConnector {
         &self.transport
+    }
+
+    /// Replace the pool reuse counters with a shared instance.
+    pub fn set_pool_counters(&mut self, counters: Arc<PoolCounters>) {
+        self.transport.set_pool_counters(counters);
     }
 
     pub fn idle_pool(&self) -> &Arc<ConnectionPool<ConnectionRef>> {

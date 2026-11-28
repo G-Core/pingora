@@ -16,8 +16,8 @@ use crate::protocols::digest::TimingDigest;
 use crate::protocols::raw_connect::ProxyDigest;
 use crate::protocols::tls::SslDigest;
 use crate::protocols::{
-    GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Shutdown, SocketDigest, Ssl, UniqueID,
-    UniqueIDType, ALPN,
+    GetProxyDigest, GetSocketDigest, GetTimingDigest, Peek, Rebind, Shutdown, SocketDigest, Ssl,
+    UniqueID, UniqueIDType, ALPN,
 };
 use crate::tls::TlsStream as S2NTlsStream;
 use crate::utils::tls::get_organization_serial_bytes;
@@ -137,6 +137,16 @@ where
             digest,
             timing,
         }
+    }
+}
+
+impl<T> TlsStream<T>
+where
+    T: Rebind + AsyncRead + AsyncWrite + Unpin,
+{
+    pub(crate) fn rebind_inner(&mut self) -> IoResult<()> {
+        let inner: &mut T = self.stream.get_mut();
+        inner.rebind()
     }
 }
 
@@ -328,5 +338,86 @@ impl<S: AsyncRead + AsyncWrite + std::marker::Unpin> Peek for TlsStream<S> {}
 impl<S: Shutdown + AsyncRead + AsyncWrite + std::marker::Unpin + Send> Shutdown for TlsStream<S> {
     async fn shutdown(&mut self) -> () {
         self.get_mut().shutdown().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AutoFlushableStream, TlsStream};
+    use crate::listeners::tls::TlsSettings;
+    use crate::protocols::l4::stream::Stream as L4Stream;
+    use crate::protocols::tls::server::handshake;
+    use crate::protocols::Rebind;
+    use pingora_s2n::{Config, IgnoreVerifyHostnameCallback, TlsConnector, DEFAULT_TLS13};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn rebind_moves_the_wrapped_transport_to_the_current_runtime() {
+        let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+        let cert = std::fs::read(&cert_path).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = TlsSettings::intermediate(&cert_path, &key_path)
+            .unwrap()
+            .build();
+
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut tls = handshake(&acceptor, L4Stream::from(tcp)).await.unwrap();
+                let mut buf = [0u8; 4];
+                tls.read_exact(&mut buf).await.unwrap();
+                tls.write_all(&buf).await.unwrap();
+            });
+        });
+
+        let runtime_a = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut tls = runtime_a.block_on(async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let inner = AutoFlushableStream::new(L4Stream::from(tcp), true);
+            let mut builder = Config::builder();
+            builder.set_security_policy(&DEFAULT_TLS13).unwrap();
+            builder
+                .set_verify_host_callback(IgnoreVerifyHostnameCallback::new())
+                .unwrap();
+            builder.trust_pem(&cert).unwrap();
+            let config = builder.build().unwrap();
+            let mut s2n = TlsConnector::new(config)
+                .connect("localhost", inner)
+                .await
+                .unwrap();
+            s2n.get_mut().set_auto_flush(false);
+            TlsStream::from_s2n_stream(s2n, Duration::ZERO)
+        });
+        drop(runtime_a);
+
+        let runtime_b = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime_b.block_on(async {
+            Rebind::rebind(&mut tls).expect("rebind onto the new runtime");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tls.write_all(b"ping").await.unwrap();
+                let mut buf = [0u8; 4];
+                tls.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"ping");
+            })
+            .await
+            .expect("the wrapped transport must move to the taking runtime");
+        });
+        server.join().unwrap();
+        drop(tls);
     }
 }

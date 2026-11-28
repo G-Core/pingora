@@ -20,6 +20,7 @@ use log::{debug, trace};
 use pingora_error::{Error, ErrorType::*, OrErr, Result, RetryType};
 use pingora_http::{HMap, HeaderNameConstant, IntoCaseHeaderName, RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::str;
 use std::time::Duration;
@@ -70,6 +71,19 @@ pub struct HttpSession {
 }
 
 /// HTTP 1.x client session
+async fn read_body_within<T>(
+    read_timeout: Option<Duration>,
+    read: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match read_timeout {
+        Some(t) => match timeout(t, read).await {
+            Ok(res) => res,
+            Err(_) => Error::e_explain(ReadTimedout, format!("reading body, timeout: {t:?}")),
+        },
+        None => read.await,
+    }
+}
+
 impl HttpSession {
     /// Create a new http client session from an established (TCP or TLS) [`Stream`].
     pub fn new(stream: Stream) -> Self {
@@ -473,17 +487,18 @@ impl HttpSession {
             .await
     }
 
+    async fn do_read_body_bytes(&mut self) -> Result<Option<Bytes>> {
+        self.init_body_reader();
+        self.body_reader
+            .read_body_bytes(&mut self.underlying_stream)
+            .await
+    }
+
     /// Read the response body into the internal buffer.
     /// Return `Ok(Some(ref)) after a successful read.
     /// Return `Ok(None)` if there is no more body to read.
     pub async fn read_body_ref(&mut self) -> Result<Option<&[u8]>> {
-        let result = match self.read_timeout {
-            Some(t) => match timeout(t, self.do_read_body()).await {
-                Ok(res) => res,
-                Err(_) => Error::e_explain(ReadTimedout, format!("reading body, timeout: {t:?}")),
-            },
-            None => self.do_read_body().await,
-        };
+        let result = read_body_within(self.read_timeout, self.do_read_body()).await;
 
         result.map(|maybe_body| {
             maybe_body.map(|body_ref| {
@@ -496,8 +511,13 @@ impl HttpSession {
 
     /// Similar to [`Self::read_body_ref`] but return `Bytes` instead of a slice reference.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        let read = self.read_body_ref().await?;
-        Ok(read.map(Bytes::copy_from_slice))
+        let result = read_body_within(self.read_timeout, self.do_read_body_bytes()).await;
+
+        result.map(|maybe_body| {
+            maybe_body.inspect(|body| {
+                self.body_recv = self.body_recv.saturating_add(body.len());
+            })
+        })
     }
 
     /// Upstream response body bytes received (payload only; excludes headers/framing).

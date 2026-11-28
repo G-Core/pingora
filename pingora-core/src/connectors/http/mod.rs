@@ -15,7 +15,7 @@
 //! Connecting to HTTP servers
 
 use crate::connectors::http::custom::Connection;
-use crate::connectors::ConnectorOptions;
+use crate::connectors::{ConnectorOptions, PoolCounters};
 use crate::listeners::ALPN;
 use crate::protocols::http::client::HttpSession;
 use crate::protocols::http::v1::client::HttpSession as Http1Session;
@@ -166,6 +166,13 @@ where
     /// Return a shared reference to the unexpected data connection counter for periodic metric reporting.
     pub fn unexpected_data_connection_counter(&self) -> Arc<AtomicU64> {
         self.h1.unexpected_data_connection_counter()
+    }
+
+    /// Make both the HTTP/1 and HTTP/2 transports report into one shared set of
+    /// pool reuse counters, so a server can expose a single aggregate.
+    pub fn set_pool_counters(&mut self, counters: Arc<PoolCounters>) {
+        self.h1.set_pool_counters(Arc::clone(&counters));
+        self.h2.set_pool_counters(counters);
     }
 }
 

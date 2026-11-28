@@ -108,6 +108,11 @@ pub struct ServerConf {
     /// [`ConnectorOptions`](crate::connectors::ConnectorOptions).
     /// Note: this is an _unstable_ field that may be renamed or removed in the future.
     pub upstream_keepalive_pool_size: usize,
+    /// How long a released upstream connection stays in the per-worker L1 cache,
+    /// in milliseconds. Zero disables L1.
+    pub upstream_pool_l1_window_millis: u64,
+    /// Maximum connections held per worker in L1.
+    pub upstream_pool_l1_capacity: usize,
     /// Number of dedicated thread pools to use for upstream connection establishment.
     /// See [`ConnectorOptions`](crate::connectors::ConnectorOptions).
     /// Note: this is an _unstable_ field that may be renamed or removed in the future.
@@ -238,6 +243,8 @@ impl Default for ServerConf {
             work_stealing: true,
             runtime_enable_alt_timer: false,
             upstream_keepalive_pool_size: 128,
+            upstream_pool_l1_window_millis: 0,
+            upstream_pool_l1_capacity: 32,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
             downstream_tls_offload_threadpools: None,
@@ -486,6 +493,8 @@ mod tests {
             work_stealing: true,
             runtime_enable_alt_timer: false,
             upstream_keepalive_pool_size: 4,
+            upstream_pool_l1_window_millis: 0,
+            upstream_pool_l1_capacity: 32,
             upstream_connect_offload_threadpools: None,
             upstream_connect_offload_thread_per_pool: None,
             downstream_tls_offload_threadpools: None,

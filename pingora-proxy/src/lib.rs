@@ -60,7 +60,7 @@ use pingora_core::apps::{
     HttpPersistentSettings, HttpServerApp, HttpServerOptions, ReusedHttpStream,
 };
 use pingora_core::connectors::http::custom;
-use pingora_core::connectors::{http::Connector, ConnectorOptions};
+use pingora_core::connectors::{http::Connector, ConnectorOptions, PoolCounters};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
 use pingora_core::protocols::http::client::HttpSession as ClientSession;
@@ -284,6 +284,12 @@ where
     /// Return a shared reference to the unexpected data connection counter for periodic metric reporting.
     pub fn unexpected_data_connection_counter(&self) -> Arc<AtomicU64> {
         self.client_upstream.unexpected_data_connection_counter()
+    }
+
+    /// Make the upstream connector report its pool reuse events into a shared
+    /// counter set the server can expose.
+    pub fn set_pool_counters(&mut self, counters: Arc<PoolCounters>) {
+        self.client_upstream.set_pool_counters(counters);
     }
 
     /// Initialize the downstream modules for this proxy.

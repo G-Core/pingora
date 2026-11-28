@@ -86,6 +86,41 @@ pub trait Peek {
 use std::any::Any;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+/// Move a connection's reactor registration to the runtime that is current now.
+///
+/// An idle pooled connection keeps the IO-driver registration of the worker
+/// that released it. Taking it on another worker must move the registration,
+/// otherwise every readiness event on the socket wakes the releasing worker.
+pub trait Rebind {
+    /// Re-register with the current runtime's IO driver. Fallible: tokio's
+    /// `TcpStream::into_std`/`from_std` both return errors.
+    fn rebind(&mut self) -> std::io::Result<()>;
+}
+
+impl<T: 'static> Rebind for T {
+    fn rebind(&mut self) -> std::io::Result<()> {
+        rebind_any(self)
+    }
+}
+
+/// Dispatch a rebind to the concrete transport type. Unknown types are no-ops
+/// (test doubles, in-memory streams).
+fn rebind_any<T: 'static>(value: &mut T) -> std::io::Result<()> {
+    let any = value as &mut dyn Any;
+    if let Some(stream) = any.downcast_mut::<l4::stream::Stream>() {
+        return stream.rebind_inner();
+    }
+    #[cfg(feature = "openssl_derived")]
+    if let Some(stream) = any.downcast_mut::<tls::SslStream<l4::stream::Stream>>() {
+        return stream.rebind_inner();
+    }
+    #[cfg(any(feature = "rustls", feature = "s2n"))]
+    if let Some(stream) = any.downcast_mut::<tls::TlsStream<l4::stream::Stream>>() {
+        return stream.rebind_inner();
+    }
+    Ok(())
+}
+
 /// The abstraction of transport layer IO
 pub trait IO:
     AsyncRead
@@ -97,6 +132,7 @@ pub trait IO:
     + GetProxyDigest
     + GetSocketDigest
     + Peek
+    + Rebind
     + Unpin
     + Debug
     + Send
@@ -118,6 +154,7 @@ impl<
             + GetProxyDigest
             + GetSocketDigest
             + Peek
+            + Rebind
             + Unpin
             + Debug
             + Send

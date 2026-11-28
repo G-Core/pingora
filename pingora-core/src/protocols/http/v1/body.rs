@@ -30,6 +30,9 @@ use crate::utils::BufRef;
 
 // TODO: make this dynamically adjusted
 const BODY_BUFFER_SIZE: usize = 1024 * 64;
+// Chunks below this are copied out of the read buffer; sharing a small chunk would pin the whole
+// BODY_BUFFER_SIZE block for as long as the chunk is held.
+const SMALL_CHUNK_COPY_LIMIT: usize = 1024 * 8;
 // limit how much incomplete chunk-size and chunk-ext to buffer
 const PARTIAL_CHUNK_HEAD_LIMIT: usize = 1024 * 8;
 // Trailers: https://datatracker.ietf.org/doc/html/rfc9112#section-7.1.2
@@ -392,6 +395,53 @@ impl BodyReader {
             PS::UntilClose(_) => self.do_read_body_until_closed(stream).await,
             PS::ToStart => panic!("need to init BodyReader first"),
         }
+    }
+
+    /// Like [`Self::read_body`] but hands the chunk out as shared `Bytes`.
+    pub async fn read_body_bytes<S>(&mut self, stream: &mut S) -> Result<Option<Bytes>>
+    where
+        S: AsyncRead + Unpin + Send,
+    {
+        match self.read_body(stream).await? {
+            Some(chunk) => Ok(Some(self.take_chunk_bytes(&chunk)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Split `chunk` out of the read buffer so it is never overwritten by later reads.
+    fn take_chunk_bytes(&mut self, chunk: &BufRef) -> Result<Bytes> {
+        let (start, end) = (chunk.0, chunk.1);
+        if start == end {
+            return Ok(Bytes::new());
+        }
+        let mut buf = self.body_buf.take().ok_or_else(|| {
+            Error::explain(
+                InternalError,
+                "body chunk reported without a body buffer".to_string(),
+            )
+        })?;
+        // Anything after the chunk stays for the next parse / pipelined request. It begins at
+        // `end`, so the parser's buffer-relative indices shift by `end`.
+        let (chunk, rest) = if end - start < SMALL_CHUNK_COPY_LIMIT {
+            let bytes = buf.get(start..end).ok_or_else(|| {
+                Error::explain(
+                    InternalError,
+                    "body chunk outside the body buffer".to_string(),
+                )
+            })?;
+            let chunk = Bytes::copy_from_slice(bytes);
+            (chunk, buf.split_off(end))
+        } else {
+            let mut chunk_buf = buf.split_off(start);
+            let rest = chunk_buf.split_off(end - start);
+            (chunk_buf.freeze(), rest)
+        };
+        self.body_buf = Some(rest);
+        if let PS::Chunked(_, ref mut buf_start, ref mut buf_end, _) = self.body_state {
+            *buf_start = buf_start.saturating_sub(end);
+            *buf_end = buf_end.saturating_sub(end);
+        }
+        Ok(chunk)
     }
 
     pub async fn do_read_body<S>(&mut self, stream: &mut S) -> Result<Option<BufRef>>
@@ -2292,6 +2342,227 @@ mod tests {
         assert_eq!(body_reader.body_state, ParseState::Complete(3));
         assert_eq!(&input2[0..2], body_reader.get_body(&res));
         assert_eq!(body_reader.get_body_overread(), Some(&b"d"[..]));
+    }
+
+    #[tokio::test]
+    async fn read_bytes_content_length_larger_than_read_buf() {
+        let body: Vec<u8> = (0..BODY_BUFFER_SIZE + 8).map(|i| i as u8).collect();
+        let mut mock_io = Builder::new()
+            .read(&body[..BODY_BUFFER_SIZE])
+            .read(&body[BODY_BUFFER_SIZE..])
+            .build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.init_content_length(body.len(), b"");
+
+        let first = body_reader
+            .read_body_bytes(&mut mock_io)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&first[..], &body[..BODY_BUFFER_SIZE]);
+        let second = body_reader
+            .read_body_bytes(&mut mock_io)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&second[..], &body[BODY_BUFFER_SIZE..]);
+        assert!(body_reader.body_complete());
+        assert!(body_reader
+            .read_body_bytes(&mut mock_io)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn read_bytes_large_chunked_chunks_share_allocation() {
+        let chunk = vec![b'x'; SMALL_CHUNK_COPY_LIMIT];
+        let mut wire = Vec::new();
+        for _ in 0..2 {
+            wire.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            wire.extend_from_slice(&chunk);
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        let mut mock_io = Builder::new().read(&wire).build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.init_chunked(b"");
+
+        let first = body_reader
+            .read_body_bytes(&mut mock_io)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = body_reader
+            .read_body_bytes(&mut mock_io)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&first[..], &chunk[..]);
+        assert_eq!(&second[..], &chunk[..]);
+        // Both chunks reference the same read block: neither is a standalone copy.
+        assert!(!first.is_unique());
+        assert!(!second.is_unique());
+        assert!(second.as_ptr() > first.as_ptr());
+        assert!((second.as_ptr() as usize - first.as_ptr() as usize) < BODY_BUFFER_SIZE);
+        assert!(body_reader
+            .read_body_bytes(&mut mock_io)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(body_reader.body_complete());
+    }
+
+    #[tokio::test]
+    async fn read_bytes_small_held_chunks_do_not_pin_the_read_block() {
+        let reads: Vec<Vec<u8>> = (0..16u8).map(|i| vec![i; 100]).collect();
+        let mut builder = Builder::new();
+        for read in &reads {
+            builder.read(read);
+        }
+        let mut mock_io = builder.build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.init_content_length(reads.len() * 100, b"");
+
+        let mut held = Vec::new();
+        while let Some(chunk) = body_reader.read_body_bytes(&mut mock_io).await.unwrap() {
+            held.push(chunk);
+        }
+        assert_eq!(held.len(), reads.len());
+        for (chunk, read) in held.iter().zip(&reads) {
+            assert_eq!(&chunk[..], &read[..]);
+            assert!(
+                chunk.is_unique(),
+                "a small chunk must be an exact-size copy"
+            );
+        }
+    }
+
+    /// Reads every chunk through `read_body_bytes`, returning the body and the overread.
+    async fn collect_body_bytes(reads: &[&[u8]]) -> (Vec<u8>, Option<BytesMut>) {
+        let mut builder = Builder::new();
+        for read in reads {
+            builder.read(read);
+        }
+        let mut mock_io = builder.build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.init_chunked(b"");
+        let mut body = Vec::new();
+        while let Some(chunk) = body_reader.read_body_bytes(&mut mock_io).await.unwrap() {
+            body.extend_from_slice(&chunk);
+        }
+        assert!(body_reader.body_complete());
+        (body, body_reader.take_body_overread())
+    }
+
+    #[tokio::test]
+    async fn read_bytes_chunk_head_split_across_reads() {
+        let (body, overread) = collect_body_bytes(&[b"1\r", b"\na\r\n0\r\n\r\n"]).await;
+        assert_eq!(body, b"a");
+        assert!(overread.is_none());
+        let (body, overread) = collect_body_bytes(&[b"1", b"\r\na\r\n", b"0\r\n\r\n"]).await;
+        assert_eq!(body, b"a");
+        assert!(overread.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_bytes_chunk_payload_and_crlf_split_across_reads() {
+        let (body, _) = collect_body_bytes(&[b"3\r\n", b"abc\r", b"\n0\r\n\r\n"]).await;
+        assert_eq!(body, b"abc");
+        let (body, _) =
+            collect_body_bytes(&[b"3\r\nab", b"c", b"\r\n2\r\nde\r", b"\n0\r\n\r\n"]).await;
+        assert_eq!(body, b"abcde");
+    }
+
+    #[tokio::test]
+    async fn read_bytes_large_chunk_payload_split_across_reads() {
+        let payload = vec![b'y'; SMALL_CHUNK_COPY_LIMIT + 100];
+        let head = format!("{:x}\r\n", payload.len());
+        let (body, overread) = collect_body_bytes(&[
+            head.as_bytes(),
+            &payload[..5000],
+            &payload[5000..],
+            b"\r\n0\r\n\r\n",
+        ])
+        .await;
+        assert_eq!(body, payload);
+        assert!(overread.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_bytes_zero_chunk_trailers_and_overread() {
+        let (body, overread) = collect_body_bytes(&[
+            b"1\r\na\r\n2\r\nbc\r\n",
+            b"0\r\nabc: hi",
+            b"\r\ndef: bye\r",
+            b"\nghi: more\r\n",
+            b"\r\nNEXT",
+        ])
+        .await;
+        assert_eq!(body, b"abc");
+        assert_eq!(overread.as_deref(), Some(&b"NEXT"[..]));
+
+        let (body, overread) = collect_body_bytes(&[b"1\r", b"\na\r\n0\r\n\r", b"\nabcd"]).await;
+        assert_eq!(body, b"a");
+        assert_eq!(overread.as_deref(), Some(&b"abcd"[..]));
+    }
+
+    #[tokio::test]
+    async fn read_bytes_close_delimited() {
+        let mut mock_io = Builder::new().read(b"hello").read(b"").build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.init_close_delimited(b"");
+
+        let chunk = body_reader
+            .read_body_bytes(&mut mock_io)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&chunk[..], b"hello");
+        assert!(body_reader
+            .read_body_bytes(&mut mock_io)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(body_reader.body_complete());
+    }
+
+    #[tokio::test]
+    async fn read_bytes_content_length_keeps_overread_for_next_response() {
+        let mut mock_io = Builder::new().read(b"abNEXT").build();
+        let mut body_reader = BodyReader::new(true);
+        body_reader.init_content_length(2, b"");
+
+        let body = body_reader
+            .read_body_bytes(&mut mock_io)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&body[..], b"ab");
+        assert_eq!(
+            body_reader.take_body_overread().as_deref(),
+            Some(&b"NEXT"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn read_bytes_held_chunk_survives_later_reads() {
+        let mut mock_io = Builder::new().read(b"a").read(b"bc").build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.init_content_length(3, b"");
+
+        let first = body_reader
+            .read_body_bytes(&mut mock_io)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = body_reader
+            .read_body_bytes(&mut mock_io)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&first[..], b"a");
+        assert_eq!(&second[..], b"bc");
     }
 
     #[tokio::test]

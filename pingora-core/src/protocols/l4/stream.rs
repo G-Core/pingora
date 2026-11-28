@@ -589,6 +589,7 @@ pub struct Stream {
     // the data put back at the front of the read buffer, in order to replay the read
     rewind_read_buf: Vec<Vec<u8>>,
     buffer_write: bool,
+    write_capacity: usize,
     proxy_digest: Option<Arc<ProxyDigest>>,
     socket_digest: Option<Arc<SocketDigest>>,
     /// When this connection is established
@@ -698,6 +699,7 @@ impl Stream {
         // Since BufStream doesn't provide an API to adjust the buf directly,
         // we take the raw stream out of it and put it in a new BufStream with the size we want
         let stream = mem::take(&mut self.stream);
+        self.write_capacity = buffer.write_capacity();
         let stream = stream.map(|s| {
             let mut raw = s.into_inner();
             raw.set_pooled_read_buffer(buffer.read_capacity());
@@ -717,6 +719,7 @@ impl From<TcpStream> for Stream {
             )),
             rewind_read_buf: Vec::new(),
             buffer_write: true,
+            write_capacity: 0,
             established_ts: SystemTime::now(),
             establishment_duration: None,
             offload_wait_duration: None,
@@ -740,6 +743,7 @@ impl From<virt::VirtualSocketStream> for Stream {
             )),
             rewind_read_buf: Vec::new(),
             buffer_write: true,
+            write_capacity: 0,
             established_ts: SystemTime::now(),
             establishment_duration: None,
             offload_wait_duration: None,
@@ -764,6 +768,7 @@ impl From<UnixStream> for Stream {
             )),
             rewind_read_buf: Vec::new(),
             buffer_write: true,
+            write_capacity: 0,
             established_ts: SystemTime::now(),
             establishment_duration: None,
             offload_wait_duration: None,
@@ -774,6 +779,56 @@ impl From<UnixStream> for Stream {
             write_pending_time: AccumulatedDuration::new(),
             rx_ts: None,
         }
+    }
+}
+
+impl RawStream {
+    /// Consume and re-create the socket on the current runtime's IO driver.
+    fn rebind(self) -> io::Result<Self> {
+        Ok(match self {
+            RawStream::Tcp(stream) => RawStream::Tcp(TcpStream::from_std(stream.into_std()?)?),
+            #[cfg(unix)]
+            RawStream::Unix(stream) => RawStream::Unix(UnixStream::from_std(stream.into_std()?)?),
+            RawStream::Virtual(stream) => RawStream::Virtual(stream),
+        })
+    }
+}
+
+impl Stream {
+    /// Move the socket onto the current runtime's IO driver. On error the socket
+    /// is gone and the stream must only be dropped.
+    pub(crate) fn rebind_inner(&mut self) -> io::Result<()> {
+        // `into_inner` discards unflushed write bytes, so refuse to rebind with any pending.
+        if self.stream.is_some() && !matches!(self.flush().now_or_never(), Some(Ok(()))) {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        let Some(stream) = self.stream.take() else {
+            return Ok(());
+        };
+        let RawStreamWrapper {
+            stream,
+            rx_ts,
+            #[cfg(target_os = "linux")]
+            enable_rx_ts,
+            #[cfg(target_os = "linux")]
+            reusable_cmsg_space,
+            read_buf,
+        } = stream.into_inner();
+        let stream = stream.rebind()?;
+        self.stream = Some(BufStream::with_capacity(
+            0,
+            self.write_capacity,
+            RawStreamWrapper {
+                stream,
+                rx_ts,
+                #[cfg(target_os = "linux")]
+                enable_rx_ts,
+                #[cfg(target_os = "linux")]
+                reusable_cmsg_space,
+                read_buf,
+            },
+        ));
+        Ok(())
     }
 }
 
@@ -872,8 +927,12 @@ impl Drop for Stream {
         if let Some(t) = self.tracer.as_ref() {
             t.0.on_disconnected();
         }
+        // A failed `rebind_inner` leaves no socket behind.
+        let Some(stream) = self.stream.as_ref() else {
+            return;
+        };
         /* use nodelay/local_addr function to detect socket status */
-        let ret = match &self.stream().get_ref().stream {
+        let ret = match &stream.get_ref().stream {
             RawStream::Tcp(s) => s.nodelay().err(),
             #[cfg(unix)]
             RawStream::Unix(s) => s.local_addr().err(),
@@ -1288,5 +1347,53 @@ mod tests {
         let mut buffer = vec![];
         stream.read_to_end(&mut buffer).await.unwrap();
         assert_eq!(buffer, message[2..]);
+    }
+
+    /// Make the deregister step of `rebind` fail by replacing the socket behind the
+    /// registered fd with `/dev/null`, which epoll never saw.
+    fn sabotage_registration(stream: &Stream) {
+        use std::os::fd::AsRawFd;
+        let fd = stream.as_raw_fd();
+        // SAFETY: the path is a valid NUL-terminated string and `open` has no memory
+        // effects; the new fd is closed below after `dup2` copies it.
+        let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert!(null >= 0);
+        // SAFETY: `null` and `fd` are open fds owned by this test and the stream; `dup2`
+        // atomically repoints `fd`, which the stream still owns and closes on drop.
+        assert_eq!(unsafe { libc::dup2(null, fd) }, fd);
+        // SAFETY: `null` is the fd opened above and is not used again.
+        unsafe { libc::close(null) };
+    }
+
+    #[tokio::test]
+    async fn a_failed_rebind_leaves_a_stream_that_drops_without_panicking() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut stream: Stream = TcpStream::connect(addr).await.unwrap().into();
+        sabotage_registration(&stream);
+
+        assert!(stream.rebind_inner().is_err(), "the rebind must fail");
+        // Used to panic in `Drop` ("stream should always be set").
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn rebind_keeps_unflushed_writes_and_the_write_buffer_size() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut stream: Stream = TcpStream::connect(addr).await.unwrap().into();
+        stream.set_buffer(L4BufferSettings::new(0, 4096));
+        let (mut peer, _) = listener.accept().await.unwrap();
+
+        stream.write_all(b"hi").await.unwrap();
+        stream.rebind_inner().unwrap();
+        assert_eq!(stream.write_capacity, 4096);
+
+        let mut buf = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut buf))
+            .await
+            .expect("the buffered bytes must reach the peer")
+            .unwrap();
+        assert_eq!(&buf, b"hi");
     }
 }
